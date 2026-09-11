@@ -29,6 +29,9 @@
 //! `ibm-mq://host:1414/<queue manager>/<queue>`,
 //! `host:1414/<queue manager>/<queue>`, `<queue manager>/<queue>` on the
 //! configured server, or `<queue>` on the configured queue manager.
+//!
+//! The transport is its own far end (ADR-0051): [`Loopback`] stands the
+//! queue manager up at the server address and takes the one put.
 
 pub mod client;
 pub mod descriptor;
@@ -40,10 +43,12 @@ use std::time::Duration;
 
 pub use client::{Client, DEFAULT_CHANNEL, DEFAULT_MAX_MESSAGE};
 pub use manager::{Event, QueueManager, Session};
-use transport::error::{Result, TransportError};
+use transport::error::{Result, TransportError, protocol_error};
+use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
 use transport::{Arrived, Directions, Transport};
 
+#[derive(Clone)]
 pub struct IbmMqTransport {
     server: String,
     queue_manager: String,
@@ -187,6 +192,67 @@ impl Transport for IbmMqTransport {
     }
 }
 
+impl IbmMqTransport {
+    /// Both ends on this machine: the queue manager stands up on an
+    /// ephemeral local port with one queue, the loopback timeout on both
+    /// sides.
+    #[must_use]
+    pub fn loopback() -> Self {
+        Self::new("127.0.0.1:0", "QM1", "ORDERS").timing_out_after(LOOPBACK_TIMEOUT)
+    }
+}
+
+/// A bound listener waiting for its one client, to be answered as this
+/// transport's queue manager.
+struct Listening {
+    transport: IbmMqTransport,
+    listener: TcpListener,
+    address: String,
+}
+
+impl FarEnd for Listening {
+    fn address(&self) -> &str {
+        &self.address
+    }
+
+    fn take_one(self: Box<Self>) -> Result<Arrived> {
+        let mut session = self.transport.accept_one(&self.listener, &[])?;
+        let put = session
+            .next_put()?
+            .ok_or_else(|| protocol_error("connected, but nothing was put"))?;
+        // The client's send is not over until its close and disconnect are
+        // answered; a queue manager that hangs up after the put aborts them.
+        while session.next_event()?.is_some() {}
+        Ok(put)
+    }
+}
+
+impl Loopback for IbmMqTransport {
+    /// `MAXMSGL` as MQ ships it: four mebibytes, what the two sides agree
+    /// on when neither says otherwise.
+    fn ceiling(&self) -> Option<usize> {
+        Some(DEFAULT_MAX_MESSAGE as usize)
+    }
+
+    fn far_end(&self) -> Result<Box<dyn FarEnd>> {
+        let (listener, address) = self.bind()?;
+        Ok(Box::new(Listening {
+            transport: self.clone(),
+            listener,
+            address,
+        }))
+    }
+
+    fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
+        let near = Self::new(address, &self.queue_manager, &self.queue).on_channel(&self.channel);
+        match self.timeout {
+            Some(timeout) => near.timing_out_after(timeout),
+            None => near,
+        }
+        .send(&self.queue, payload)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +387,48 @@ mod tests {
             ("other:1414", "QM2", "Q")
         );
         assert_eq!(mq.resolve("Q").expect("queue"), ("host:1414", "QM1", "Q"));
+    }
+
+    /// The payloads a message must carry whole, and one at `MAXMSGL`.
+    fn edge_payloads() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("empty", Vec::new()),
+            ("one byte", vec![0x2a]),
+            ("every byte", (0..=255).collect()),
+            ("nul run", vec![0; 512]),
+            ("high bytes", vec![0xff; 512]),
+            ("crlf storm", b"\r\n".repeat(400)),
+            ("the brim", vec![b'q'; DEFAULT_MAX_MESSAGE as usize]),
+        ]
+    }
+
+    #[test]
+    fn a_loopback_round_puts_one_message_and_takes_it_at_the_queue_manager() {
+        let mq = IbmMqTransport::loopback();
+        let arrived = mq.round(b"order\0\xff").expect("round");
+        assert_eq!(arrived.bytes, b"order\0\xff");
+        assert!(
+            arrived
+                .origin_uri
+                .starts_with("ibm-mq://QM1/ORDERS?msgid=414d5120"),
+            "{}",
+            arrived.origin_uri
+        );
+        assert_eq!(mq.name(), "ibm-mq");
+        assert!(mq.refuses(&[0, 0xff]).is_none(), "bytes are bytes");
+    }
+
+    #[test]
+    fn the_loopback_returns_the_edge_payloads_whole_and_refuses_over_the_brim() {
+        let mq = IbmMqTransport::loopback();
+        assert_eq!(mq.ceiling(), Some(4 * 1024 * 1024));
+        for (name, payload) in edge_payloads() {
+            let arrived = mq.round(&payload).expect(name);
+            assert_eq!(arrived.bytes, payload, "{name}");
+        }
+        let over = vec![b'q'; DEFAULT_MAX_MESSAGE as usize + 1];
+        let failure = mq.round(&over).expect_err("over the brim");
+        assert!(failure.message.starts_with("send failed:"), "{failure}");
+        assert!(failure.message.contains("MQRC 2031"), "{failure}");
     }
 }
