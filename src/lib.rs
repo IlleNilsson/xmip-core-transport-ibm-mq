@@ -44,6 +44,7 @@ use std::time::Duration;
 pub use client::{Client, DEFAULT_CHANNEL, DEFAULT_MAX_MESSAGE};
 pub use manager::{Event, QueueManager, Session};
 use transport::error::{Result, TransportError, protocol_error};
+use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
 use transport::{Arrived, Directions, Transport};
@@ -202,21 +203,9 @@ impl IbmMqTransport {
     }
 }
 
-/// A bound listener waiting for its one client, to be answered as this
-/// transport's queue manager.
-struct Listening {
-    transport: IbmMqTransport,
-    listener: TcpListener,
-    address: String,
-}
-
-impl FarEnd for Listening {
-    fn address(&self) -> &str {
-        &self.address
-    }
-
-    fn take_one(self: Box<Self>) -> Result<Arrived> {
-        let mut session = self.transport.accept_one(&self.listener, &[])?;
+impl Accepting for IbmMqTransport {
+    fn take_one(&self, listener: &TcpListener) -> Result<Arrived> {
+        let mut session = self.accept_one(listener, &[])?;
         let put = session
             .next_put()?
             .ok_or_else(|| protocol_error("connected, but nothing was put"))?;
@@ -236,11 +225,7 @@ impl Loopback for IbmMqTransport {
 
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
         let (listener, address) = self.bind()?;
-        Ok(Box::new(Listening {
-            transport: self.clone(),
-            listener,
-            address,
-        }))
+        Ok(Box::new(Listening::new(self.clone(), listener, address)))
     }
 
     fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
@@ -256,6 +241,7 @@ impl Loopback for IbmMqTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use transport::payload::edge_payloads;
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
@@ -390,16 +376,10 @@ mod tests {
     }
 
     /// The payloads a message must carry whole, and one at `MAXMSGL`.
-    fn edge_payloads() -> Vec<(&'static str, Vec<u8>)> {
-        vec![
-            ("empty", Vec::new()),
-            ("one byte", vec![0x2a]),
-            ("every byte", (0..=255).collect()),
-            ("nul run", vec![0; 512]),
-            ("high bytes", vec![0xff; 512]),
-            ("crlf storm", b"\r\n".repeat(400)),
-            ("the brim", vec![b'q'; DEFAULT_MAX_MESSAGE as usize]),
-        ]
+    fn payloads() -> Vec<(&'static str, Vec<u8>)> {
+        let mut payloads = edge_payloads();
+        payloads.extend([("the brim", vec![b'q'; DEFAULT_MAX_MESSAGE as usize])]);
+        payloads
     }
 
     #[test]
@@ -422,7 +402,7 @@ mod tests {
     fn the_loopback_returns_the_edge_payloads_whole_and_refuses_over_the_brim() {
         let mq = IbmMqTransport::loopback();
         assert_eq!(mq.ceiling(), Some(4 * 1024 * 1024));
-        for (name, payload) in edge_payloads() {
+        for (name, payload) in payloads() {
             let arrived = mq.round(&payload).expect(name);
             assert_eq!(arrived.bytes, payload, "{name}");
         }
