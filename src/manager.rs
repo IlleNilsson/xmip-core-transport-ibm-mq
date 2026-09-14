@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use transport::Arrived;
 use transport::error::{Result, protocol_error};
+pub use transport::hex::hex;
 use transport::socket;
 
 use crate::client::{
@@ -289,17 +290,6 @@ fn refused(reason: u32, handle: u32) -> (Vec<u8>, Event) {
         ApiHeader::failed(reason, handle).encode().to_vec(),
         Event::Refused(reason),
     )
-}
-
-/// A message id as the origin carries it: lower-case hex.
-#[must_use]
-pub fn hex(id: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(id.len() * 2);
-    for byte in id {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
 
 #[cfg(test)]
