@@ -170,7 +170,7 @@ impl Transport for IbmMqTransport {
         let mut arrived = Vec::new();
         while let Some((id, bytes)) = client.get(handle)? {
             arrived.push(Arrived::new(
-                format!("{origin}{}", manager::hex(&id)),
+                format!("{origin}{}", codec::hex::encode(&id)),
                 bytes,
             ));
         }
