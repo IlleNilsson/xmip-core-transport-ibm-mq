@@ -14,9 +14,9 @@ use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
+use codec::hex;
 use transport::Arrived;
 use transport::error::{Result, protocol_error};
-pub use transport::hex::hex;
 use transport::socket;
 
 use crate::client::{
@@ -242,7 +242,7 @@ impl Session {
         let origin = format!(
             "ibm-mq://{}/{queue}?msgid={}",
             self.manager.name,
-            hex(&descriptor.message_id)
+            hex::encode(&descriptor.message_id)
         );
         let mut reply = ApiHeader::call(handle).encode().to_vec();
         reply.extend_from_slice(&descriptor.encode());
@@ -305,6 +305,5 @@ mod tests {
         assert_eq!(manager.queues.len(), 2);
         assert_eq!(manager.queues["INVOICES"].len(), 2);
         assert_eq!(manager.max_message, 100);
-        assert_eq!(hex(&[0xab, 0x01]), "ab01");
     }
 }
