@@ -11,6 +11,7 @@ use std::io::BufReader;
 use std::net::TcpStream;
 use std::time::Duration;
 
+use transport::ceiling;
 use transport::error::{Result, TransportError, protocol_error};
 use transport::socket;
 
@@ -123,16 +124,12 @@ impl Client {
     /// Where the message is over what was agreed, or the queue manager
     /// refused.
     pub fn put(&mut self, handle: u32, bytes: &[u8]) -> Result<[u8; 24]> {
-        if bytes.len() > self.max_message as usize {
-            return Err(reason_error(
-                TOO_BIG,
-                &format!(
-                    "{} bytes is over the {} the queue manager carries",
-                    bytes.len(),
-                    self.max_message
-                ),
-            ));
-        }
+        ceiling::within(
+            bytes.len(),
+            self.max_message as usize,
+            "the queue manager carries",
+        )
+        .map_err(|refused| reason_error(TOO_BIG, &refused.message))?;
         let mut body = ApiHeader::call(handle).encode().to_vec();
         body.extend_from_slice(&MessageDescriptor::datagram("xmip").encode());
         body.extend_from_slice(&encode_put_options("", bytes.len()));
