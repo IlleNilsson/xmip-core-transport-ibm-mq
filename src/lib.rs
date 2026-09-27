@@ -47,7 +47,8 @@ use transport::error::{Result, TransportError, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Directions, Transport};
+use transport::{Arrived, Configured, Directions, Transport};
+use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
 #[derive(Clone)]
 pub struct IbmMqTransport {
@@ -193,6 +194,61 @@ impl Transport for IbmMqTransport {
     }
 }
 
+impl Configured for IbmMqTransport {
+    /// The address is the queue manager's listener, host and port: where a
+    /// Location connects.
+    const SETTINGS: &'static Settings = &Settings {
+        technology: env!("CARGO_PKG_NAME"),
+        settings: &[
+            Setting {
+                name: "queue_manager",
+                kind: Kind::Text,
+                presence: Presence::Required,
+                meaning: "The queue manager a Location connects to unless the target names \
+                          another.",
+                applies: Applies::Both,
+            },
+            Setting {
+                name: "queue",
+                kind: Kind::Text,
+                presence: Presence::Required,
+                meaning: "The queue a Location gets every waiting message from.",
+                applies: Applies::Receive,
+            },
+            Setting {
+                name: "channel",
+                kind: Kind::Text,
+                presence: Presence::Default(Fixed::Text(DEFAULT_CHANNEL)),
+                meaning: "The server-connection channel a Location connects on.",
+                applies: Applies::Both,
+            },
+            Setting {
+                name: "timeout",
+                kind: Kind::Duration,
+                presence: Presence::Optional,
+                meaning: "How long a queue manager that stops mid-reply is waited on; \
+                          unbounded when left out.",
+                applies: Applies::Both,
+            },
+        ],
+    };
+
+    /// A Send Location puts on the queue its target names, so it has no
+    /// queue of its own.
+    fn configured(address: &str, settings: &Read) -> Result<Self> {
+        let transport = Self::new(
+            address,
+            settings.text("queue_manager"),
+            settings.optional_text("queue").unwrap_or_default(),
+        )
+        .on_channel(settings.text("channel"));
+        Ok(match settings.optional_duration("timeout") {
+            Some(timeout) => transport.timing_out_after(timeout),
+            None => transport,
+        })
+    }
+}
+
 impl IbmMqTransport {
     /// Both ends on this machine: the queue manager stands up on an
     /// ephemeral local port with one queue, the loopback timeout on both
@@ -244,6 +300,33 @@ mod tests {
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    #[test]
+    fn ibm_mq_declares_its_settings_and_reads_through_them() {
+        use xcore::settings::Given;
+        assert_eq!(IbmMqTransport::SETTINGS.problems(), Vec::<String>::new());
+        let given = [
+            ("queue_manager".to_string(), Given::Text("QM1".to_string())),
+            ("queue".to_string(), Given::Text("ORDERS".to_string())),
+            ("timeout".to_string(), Given::Text("15s".to_string())),
+        ];
+        let built =
+            IbmMqTransport::open("mq.example:1414", Applies::Receive, &given).expect("built");
+        assert_eq!(built.queue_manager, "QM1");
+        assert_eq!(built.queue, "ORDERS");
+        assert_eq!(built.channel, DEFAULT_CHANNEL);
+        assert_eq!(built.timeout, Some(secs(15)));
+        let Err(refused) = IbmMqTransport::open("mq.example:1414", Applies::Send, &given[1..2])
+        else {
+            panic!("a Send Location's queue manager is required, and it names no queue");
+        };
+        assert!(
+            refused.message.contains("\"queue_manager\""),
+            "{}",
+            refused.message
+        );
+        assert!(refused.message.contains("\"queue\""), "{}", refused.message);
     }
 
     #[test]
