@@ -15,6 +15,8 @@
 
 use std::io::{Read, Write};
 
+use net::MAX_BODY;
+use transport::ceiling;
 use transport::error::{Result, classify, protocol_error};
 
 /// The transmission segment header's length: `TSHM`.
@@ -23,8 +25,6 @@ pub const TSHM_LENGTH: usize = 36;
 pub const API_LENGTH: usize = 16;
 /// The transmission size every segment stays under, as MQ negotiates it.
 pub const MAX_TRANSMISSION: usize = 32_766;
-/// The most the reader will put back together from segments.
-pub const MAX_MESSAGE: usize = transport::wire::MAX_BODY;
 
 /// Segment types, MQ's own values.
 pub const INITIAL_DATA: u8 = 0x01;
@@ -186,7 +186,7 @@ pub fn write_segment(writer: &mut impl Write, segment: &Segment) -> Result<()> {
 /// # Errors
 /// Where the connection broke, the eyecatcher is not `TSHM`, the segment
 /// is a big-endian one this reader does not take, or the pieces exceed
-/// [`MAX_MESSAGE`].
+/// `net::MAX_BODY`.
 pub fn read_segment(reader: &mut impl Read) -> Result<Option<Segment>> {
     let mut whole: Option<Segment> = None;
     loop {
@@ -226,9 +226,11 @@ pub fn read_segment(reader: &mut impl Read) -> Result<Option<Segment>> {
                 Vec::new(),
             )
         });
-        if segment.body.len() + piece.len() > MAX_MESSAGE {
-            return Err(protocol_error("more segments than Xmip will put together"));
-        }
+        ceiling::within(
+            segment.body.len() + piece.len(),
+            MAX_BODY,
+            "Xmip puts together in one message",
+        )?;
         segment.body.extend_from_slice(&piece);
         if flags & LAST != 0 {
             return Ok(whole);
