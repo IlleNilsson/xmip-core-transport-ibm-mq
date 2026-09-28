@@ -12,11 +12,11 @@ use transport::error::{Result, protocol_error};
 
 use crate::segment::be32;
 
-pub const MQMD_LENGTH: usize = 324;
+const MQMD_LENGTH: usize = 324;
 pub const MQPMO_LENGTH: usize = 128;
 pub const MQGMO_LENGTH: usize = 72;
-pub const MQOD_LENGTH: usize = 168;
-pub const ID_LENGTH: usize = 96;
+const MQOD_LENGTH: usize = 168;
+const ID_LENGTH: usize = 96;
 
 /// `MQOO_INPUT_AS_Q_DEF`.
 pub const OPEN_INPUT: u32 = 0x0000_0001;
@@ -27,7 +27,7 @@ pub const OPEN_FAIL_IF_QUIESCING: u32 = 0x0000_2000;
 /// `MQMT_DATAGRAM`.
 const DATAGRAM: u32 = 8;
 /// The level of the format and protocol this crate speaks.
-pub const FAP_LEVEL: u8 = 10;
+const FAP_LEVEL: u8 = 10;
 
 /// `text` in a field `width` wide, space-padded or cut.
 #[must_use]

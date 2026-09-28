@@ -43,11 +43,12 @@ use std::time::Duration;
 
 pub use client::{Client, DEFAULT_CHANNEL, DEFAULT_MAX_MESSAGE};
 pub use manager::{Event, QueueManager, Session};
+use net::Target;
 use transport::error::{Result, TransportError, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Configured, Directions, Transport};
+use transport::{Arrived, Configured, Directions, Pool, Transport};
 use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
 #[derive(Clone)]
@@ -57,6 +58,9 @@ pub struct IbmMqTransport {
     queue: String,
     channel: String,
     timeout: Option<Duration>,
+    /// The connections a receive gets on and a send puts on, connected once
+    /// per server and queue manager and kept.
+    connections: Pool<Client>,
 }
 
 impl IbmMqTransport {
@@ -73,12 +77,13 @@ impl IbmMqTransport {
             queue: queue.into(),
             channel: DEFAULT_CHANNEL.to_string(),
             timeout: None,
+            connections: Pool::new(),
         }
     }
 
     /// Connect on `channel` rather than `SYSTEM.DEF.SVRCONN`.
     #[must_use]
-    pub fn on_channel(mut self, channel: impl Into<String>) -> Self {
+    fn on_channel(mut self, channel: impl Into<String>) -> Self {
         self.channel = channel.into();
         self
     }
@@ -133,13 +138,10 @@ impl IbmMqTransport {
     /// Where a target names the server, queue manager and queue, or some
     /// suffix of them on what this transport is configured with.
     fn resolve<'a>(&'a self, target: &'a str) -> Result<(&'a str, &'a str, &'a str)> {
-        let (server, path) = socket::target("ibm-mq", target)
-            .or_else(|| socket::target("mq", target))
-            .or_else(|| match target.split_once('/') {
-                Some((peer, path)) if peer.contains(':') => Some((peer, path)),
-                _ => None,
-            })
-            .unwrap_or((&self.server, target));
+        let (server, path) = Target::naming_server(&["ibm-mq", "mq"], target)
+            .map_or((self.server.as_str(), target), |named| {
+                (named.authority(), named.path())
+            });
         let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         match segments.as_slice() {
             [queue_manager, queue] => Ok((server, queue_manager, queue)),
@@ -160,37 +162,45 @@ impl Transport for IbmMqTransport {
         Directions::BOTH
     }
 
-    /// Get every message waiting on the queue, oldest first.
+    /// Get every message waiting on the queue, oldest first, on the
+    /// connection kept for the queue manager and made on the first receive.
     fn receive(&self) -> Result<Vec<Arrived>> {
-        let mut client = self.connect()?;
-        let handle = client.open(
-            &self.queue,
-            descriptor::OPEN_INPUT | descriptor::OPEN_FAIL_IF_QUIESCING,
-        )?;
         let origin = Self::origin(&self.server, &self.queue_manager, &self.queue);
-        let mut arrived = Vec::new();
-        while let Some((id, bytes)) = client.get(handle)? {
-            arrived.push(Arrived::new(
-                format!("{origin}{}", codec::hex::encode(&id)),
-                bytes,
-            ));
-        }
-        client.close(handle)?;
-        client.disconnect()?;
-        Ok(arrived)
+        self.connections.exchange(
+            &format!("{}/{}", self.server, self.queue_manager),
+            || self.connect(),
+            |client| {
+                let handle = client.held(
+                    &self.queue,
+                    descriptor::OPEN_INPUT | descriptor::OPEN_FAIL_IF_QUIESCING,
+                )?;
+                let mut arrived = Vec::new();
+                while let Some((id, bytes)) = client.get(handle)? {
+                    arrived.push(Arrived::new(
+                        format!("{origin}{}", codec::hex::encode(&id)),
+                        bytes,
+                    ));
+                }
+                Ok(arrived)
+            },
+        )
     }
 
-    /// Put the bytes as one message on the queue the target names.
+    /// Put the bytes as one message on the queue the target names, on the
+    /// connection kept for its queue manager and made on the first send.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
         let (server, queue_manager, queue) = self.resolve(target)?;
-        let mut client = self.connect_to(server, queue_manager)?;
-        let handle = client.open(
-            queue,
-            descriptor::OPEN_OUTPUT | descriptor::OPEN_FAIL_IF_QUIESCING,
-        )?;
-        client.put(handle, bytes)?;
-        client.close(handle)?;
-        client.disconnect()
+        self.connections.exchange(
+            &format!("{server}/{queue_manager}"),
+            || self.connect_to(server, queue_manager),
+            |client| {
+                let handle = client.held(
+                    queue,
+                    descriptor::OPEN_OUTPUT | descriptor::OPEN_FAIL_IF_QUIESCING,
+                )?;
+                client.put(handle, bytes).map(|_| ())
+            },
+        )
     }
 }
 
@@ -342,7 +352,8 @@ mod tests {
                 IbmMqTransport::new(address.clone(), "QM1", "ORDERS").timing_out_after(secs(2));
             near.send(&format!("ibm-mq://{address}/QM1/ORDERS"), b"order\0\xff")?;
             near.send("ORDERS", &sent)?;
-            near.send("ORDERS", b"")
+            near.send("ORDERS", b"")?;
+            Ok::<_, TransportError>(near.connections.opened())
         });
         let mut session = far_end.accept_one(&listener, &[]).expect("accepting");
         assert_eq!(session.next_event().expect("conn"), Some(Event::Connected));
@@ -359,17 +370,15 @@ mod tests {
             "{}",
             first.origin_uri
         );
-        assert!(session.next_put().expect("closed").is_none());
-        let mut session = far_end.accept_one(&listener, &[]).expect("second");
+        // One queue manager, so one connection for all three puts.
         let second = session.next_put().expect("put").expect("one");
         assert_eq!(second.bytes, long, "a mebibyte across segments");
-        assert!(session.next_put().expect("closed").is_none());
-        let mut session = far_end.accept_one(&listener, &[]).expect("third");
         let third = session.next_put().expect("put").expect("one");
         assert!(third.bytes.is_empty());
         assert!(session.next_put().expect("closed").is_none());
-        assert_eq!(session.queue("ORDERS"), vec![Vec::<u8>::new()]);
-        sender.join().expect("thread").expect("sending");
+        let opened = sender.join().expect("thread").expect("sending");
+        assert_eq!(opened, 1);
+        assert_eq!(session.queue("ORDERS").len(), 3);
     }
 
     #[test]
@@ -393,7 +402,10 @@ mod tests {
             3,
             "two, then 2033"
         );
-        assert_eq!(events.last(), Some(&Event::Disconnected));
+        assert!(
+            matches!(events.last(), Some(Event::Got(_))),
+            "the connection and the queue kept open: {events:?}"
+        );
         let arrived = receiver.join().expect("thread").expect("receiving");
         assert_eq!(arrived.len(), 2);
         assert_eq!(arrived[0].bytes, b"first");
@@ -401,6 +413,84 @@ mod tests {
         assert!(arrived[0].origin_uri.starts_with("ibm-mq://127.0.0.1:"));
         assert!(arrived[0].origin_uri.contains("/QM1/ORDERS?msgid=414d5120"));
         assert!(session.queue("ORDERS").is_empty(), "got is gone");
+    }
+
+    #[test]
+    fn a_thousand_receives_connect_once_and_a_connection_the_manager_closed_is_replaced() {
+        const RECEIVES: usize = 1000;
+        let far_end = IbmMqTransport::new("127.0.0.1:0", "QM1", "ORDERS").timing_out_after(secs(5));
+        let (listener, address) = far_end.bind().expect("binding");
+        let near = IbmMqTransport::new(address, "QM1", "ORDERS").timing_out_after(secs(5));
+        let receiving = near.clone();
+        let receiver = std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            for _ in 0..RECEIVES {
+                assert!(receiving.receive()?.is_empty());
+            }
+            let took = began.elapsed();
+            // Generous for a debug build under load: a millisecond a receive.
+            assert!(took < Duration::from_millis(RECEIVES as u64), "{took:?}");
+            receiving.receive()
+        });
+        // Served until `receives` gets found the queue empty, one a
+        // receive; how many connects and opens.
+        let serve = |session: &mut Session, receives: usize| {
+            let (mut connected, mut opened, mut emptied) = (0, 0, 0);
+            while emptied < receives {
+                match session.next_event().expect("serving").expect("one") {
+                    Event::Connected => connected += 1,
+                    Event::Opened(_) => opened += 1,
+                    Event::Got(_) => emptied += 1,
+                    _ => {}
+                }
+            }
+            (connected, opened)
+        };
+        let mut session = far_end.accept_one(&listener, &[]).expect("accepting");
+        let once = serve(&mut session, RECEIVES);
+        assert_eq!(once, (1, 1), "one connect and one open for every receive");
+        drop(session);
+        let mut again = far_end
+            .accept_one(&listener, &[b"after"])
+            .expect("a new connection");
+        // The one message, then the get that finds the queue empty.
+        serve(&mut again, 2);
+        let arrived = receiver.join().expect("thread").expect("received");
+        assert_eq!(arrived[0].bytes, b"after");
+        assert_eq!(near.connections.opened(), 2);
+    }
+
+    #[test]
+    fn a_thousand_puts_connect_once_and_a_connection_the_manager_closed_is_replaced() {
+        const SENDS: usize = 1000;
+        let far_end = IbmMqTransport::new("127.0.0.1:0", "QM1", "ORDERS").timing_out_after(secs(5));
+        let (listener, address) = far_end.bind().expect("binding");
+        let near = IbmMqTransport::new(address, "QM1", "ORDERS").timing_out_after(secs(5));
+        let sending = near.clone();
+        let sender = std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            for n in 0..SENDS {
+                sending.send("ORDERS", n.to_string().as_bytes())?;
+            }
+            let took = began.elapsed();
+            // Generous for a debug build under load: a millisecond a put.
+            assert!(took < Duration::from_millis(SENDS as u64), "{took:?}");
+            sending.send("ORDERS", b"after the close")
+        });
+        // One MQCONN for every put: one connection accepted.
+        let mut session = far_end.accept_one(&listener, &[]).expect("accepting");
+        for n in 0..SENDS {
+            let put = session.next_put().expect("put").expect("one");
+            assert_eq!(put.bytes, n.to_string().as_bytes());
+        }
+        drop(session);
+        let mut again = far_end
+            .accept_one(&listener, &[])
+            .expect("a new connection");
+        let last = again.next_put().expect("put").expect("one");
+        assert_eq!(last.bytes, b"after the close");
+        sender.join().expect("thread").expect("sending");
+        assert_eq!(near.connections.opened(), 2);
     }
 
     #[test]

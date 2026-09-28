@@ -16,13 +16,13 @@
 use std::io::{Read, Write};
 
 use net::MAX_BODY;
-use transport::ceiling;
+use net::ceiling;
 use transport::error::{Result, classify, protocol_error};
 
 /// The transmission segment header's length: `TSHM`.
-pub const TSHM_LENGTH: usize = 36;
+const TSHM_LENGTH: usize = 36;
 /// The API header's length.
-pub const API_LENGTH: usize = 16;
+const API_LENGTH: usize = 16;
 /// The transmission size every segment stays under, as MQ negotiates it.
 pub const MAX_TRANSMISSION: usize = 32_766;
 
@@ -190,14 +190,12 @@ pub fn write_segment(writer: &mut impl Write, segment: &Segment) -> Result<()> {
 pub fn read_segment(reader: &mut impl Read) -> Result<Option<Segment>> {
     let mut whole: Option<Segment> = None;
     loop {
-        let mut head = [0u8; TSHM_LENGTH];
-        match reader.read_exact(&mut head) {
-            Ok(()) => {}
-            Err(e) if whole.is_none() && e.kind() == std::io::ErrorKind::UnexpectedEof => {
+        let Some(head) = net::read::header::<TSHM_LENGTH>(reader, "a segment header")? else {
+            if whole.is_none() {
                 return Ok(None);
             }
-            Err(e) => return Err(classify("reading a segment header", &e)),
-        }
+            return Err(protocol_error("a message that ended between its segments"));
+        };
         if &head[0..4] != b"TSHM" {
             return Err(protocol_error(format!(
                 "not a transmission segment: {:?}",

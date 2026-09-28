@@ -7,12 +7,14 @@
 //! that is refused here with MQ's own reason, `MQRC_MSG_TOO_BIG_FOR_Q_MGR`,
 //! before a byte of it is written.
 
+use std::collections::BTreeMap;
 use std::io::BufReader;
 use std::net::TcpStream;
 use std::time::Duration;
 
-use transport::ceiling;
+use net::ceiling;
 use transport::error::{Result, TransportError, protocol_error};
+use transport::pool::{Pooled, alive};
 use transport::socket;
 
 use crate::descriptor::{
@@ -47,6 +49,9 @@ pub struct Client {
     request: u32,
     max_message: u32,
     queue_manager: String,
+    /// The queues [`Client::held`] opened, by name and options, with their
+    /// handles: opened once on a connection and kept while it is.
+    held: BTreeMap<(String, u32), u32>,
 }
 
 impl Client {
@@ -71,6 +76,7 @@ impl Client {
             request: 0,
             max_message: DEFAULT_MAX_MESSAGE,
             queue_manager: queue_manager.to_string(),
+            held: BTreeMap::new(),
         };
         let mine = InitialData {
             max_message: DEFAULT_MAX_MESSAGE,
@@ -116,6 +122,22 @@ impl Client {
         let (header, _) = ApiHeader::decode(&reply.body)?;
         judge(&header)?;
         Ok(header.handle)
+    }
+
+    /// The handle of `queue` opened with `options` on this connection:
+    /// opened on the first ask and kept for every ask after, so a kept
+    /// connection puts or gets without an MQOPEN and MQCLOSE a message.
+    ///
+    /// # Errors
+    /// As [`Client::open`], on the first ask.
+    pub fn held(&mut self, queue: &str, options: u32) -> Result<u32> {
+        let key = (queue.to_string(), options);
+        if let Some(handle) = self.held.get(&key) {
+            return Ok(*handle);
+        }
+        let handle = self.open(queue, options)?;
+        self.held.insert(key, handle);
+        Ok(handle)
     }
 
     /// Put `bytes` as one message on `handle`, and take the id assigned.
@@ -207,6 +229,13 @@ impl Client {
 }
 
 /// `MQAT_WINDOWS_NT` or `MQAT_UNIX`, whichever this build is.
+impl Pooled for Client {
+    /// While the queue manager has not closed the connection.
+    fn usable(&mut self) -> bool {
+        alive(&self.writer)
+    }
+}
+
 fn application_type() -> u32 {
     if cfg!(windows) { 11 } else { 6 }
 }
@@ -222,7 +251,7 @@ fn judge(header: &ApiHeader) -> Result<()> {
 /// What a reason code means to resilience: a queue manager not available,
 /// a broken connection or a full queue will clear; the rest will not.
 #[must_use]
-pub fn reason_error(reason: u32, context: &str) -> TransportError {
+fn reason_error(reason: u32, context: &str) -> TransportError {
     let retryable = matches!(reason, 2009 | 2053 | 2059 | 2161 | 2162 | 2195);
     TransportError {
         message: format!("{context}: MQRC {reason}"),
