@@ -34,6 +34,8 @@ pub const MQOPEN: u8 = 0x83;
 pub const MQCLOSE: u8 = 0x84;
 pub const MQGET: u8 = 0x85;
 pub const MQPUT: u8 = 0x86;
+pub const MQCMIT: u8 = 0x8A;
+pub const MQBACK: u8 = 0x8B;
 /// A reply is its call's type with the reply bit.
 pub const REPLY: u8 = 0x10;
 

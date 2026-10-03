@@ -1,5 +1,5 @@
 //! Xmip's side of one conversation with a queue manager: connect, open,
-//! put, get, close, disconnect.
+//! put, get under syncpoint, commit, back out, close, disconnect.
 //!
 //! Each call is one segment out and one reply back on the same
 //! conversation, the request id counting up. The initial data exchange
@@ -13,17 +13,17 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use net::ceiling;
-use transport::error::{Result, TransportError, protocol_error};
+use transport::error::{Result, TransportError, classify, protocol_error};
 use transport::pool::{Pooled, alive};
 use transport::socket;
 
 use crate::descriptor::{
-    InitialData, MQGMO_LENGTH, MessageDescriptor, decode_options, encode_get_options,
-    encode_object, encode_put_options, fixed,
+    GET_FAIL_IF_QUIESCING, GET_SYNCPOINT, GET_WAIT, InitialData, MQGMO_LENGTH, MessageDescriptor,
+    decode_options, encode_get_options, encode_object, encode_put_options, fixed,
 };
 use crate::segment::{
-    ApiHeader, INITIAL_DATA, MQCLOSE, MQCONN, MQDISC, MQGET, MQOPEN, MQPUT, REPLY, Segment,
-    read_segment, write_segment,
+    ApiHeader, INITIAL_DATA, MQBACK, MQCLOSE, MQCMIT, MQCONN, MQDISC, MQGET, MQOPEN, MQPUT, REPLY,
+    Segment, read_segment, write_segment,
 };
 
 /// The largest message a queue manager carries unless told otherwise:
@@ -52,6 +52,11 @@ pub struct Client {
     /// The queues [`Client::held`] opened, by name and options, with their
     /// handles: opened once on a connection and kept while it is.
     held: BTreeMap<(String, u32), u32>,
+    /// Whether a get under syncpoint has opened a unit of work that is
+    /// neither committed nor backed out.
+    in_unit: bool,
+    /// How long a reply is waited on beyond what the call itself waits.
+    timeout: Option<Duration>,
 }
 
 impl Client {
@@ -77,6 +82,8 @@ impl Client {
             max_message: DEFAULT_MAX_MESSAGE,
             queue_manager: queue_manager.to_string(),
             held: BTreeMap::new(),
+            in_unit: false,
+            timeout,
         };
         let mine = InitialData {
             max_message: DEFAULT_MAX_MESSAGE,
@@ -163,17 +170,44 @@ impl Client {
         Ok(descriptor.message_id)
     }
 
-    /// Get the next message on `handle`: its id and its bytes, or `None`
-    /// where the queue is empty.
+    /// Get the next message on `handle` under syncpoint: its id and its
+    /// bytes, or `None` where the queue is still empty after `wait`. An
+    /// empty queue is waited on by the queue manager (`MQGMO_WAIT`, the
+    /// wait interval in milliseconds), and a message put meanwhile comes at
+    /// once; a zero `wait` answers at once. The reply is read for `wait`
+    /// beyond the connection's timeout. The message leaves the queue only
+    /// at [`Client::commit`]; [`Client::back_out`], or a connection that
+    /// breaks first, puts it back.
     ///
     /// # Errors
     /// Where the queue manager refused for a reason other than an empty
     /// queue.
-    pub fn get(&mut self, handle: u32) -> Result<Option<([u8; 24], Vec<u8>)>> {
+    pub fn get(&mut self, handle: u32, wait: Duration) -> Result<Option<([u8; 24], Vec<u8>)>> {
         let mut body = ApiHeader::call(handle).encode().to_vec();
         body.extend_from_slice(&MessageDescriptor::datagram("").encode());
-        body.extend_from_slice(&encode_get_options("", self.max_message as usize));
-        let reply = self.call(MQGET, body)?;
+        let mut options = GET_SYNCPOINT | GET_FAIL_IF_QUIESCING;
+        if !wait.is_zero() {
+            options |= GET_WAIT;
+        }
+        // MQ's wait interval is a signed 32-bit count of milliseconds.
+        let interval = u32::try_from(wait.as_millis().min(i32::MAX as u128)).unwrap_or(0);
+        body.extend_from_slice(&encode_get_options(
+            "",
+            options,
+            interval,
+            self.max_message as usize,
+        ));
+        let waited = self.timeout.map(|timeout| timeout + wait);
+        self.reader
+            .get_ref()
+            .set_read_timeout(waited)
+            .map_err(|e| classify("waiting on a get", &e))?;
+        let reply = self.call(MQGET, body);
+        self.reader
+            .get_ref()
+            .set_read_timeout(self.timeout)
+            .map_err(|e| classify("waiting on a reply", &e))?;
+        let reply = reply?;
         let (header, rest) = ApiHeader::decode(&reply.body)?;
         if header.reason == NO_MESSAGE {
             return Ok(None);
@@ -184,7 +218,42 @@ impl Client {
         let data = data
             .get(..length)
             .ok_or_else(|| protocol_error("a got message shorter than its length"))?;
+        self.in_unit = true;
         Ok(Some((descriptor.message_id, data.to_vec())))
+    }
+
+    /// `MQCMIT`: every message got under syncpoint since the last commit or
+    /// back out leaves its queue.
+    ///
+    /// # Errors
+    /// Where the queue manager refused, or the connection broke: the unit
+    /// is then backed out by the queue manager.
+    pub fn commit(&mut self) -> Result<()> {
+        self.settle(MQCMIT)
+    }
+
+    /// `MQBACK`: every message got under syncpoint since the last commit or
+    /// back out goes back on its queue, to be got again.
+    ///
+    /// # Errors
+    /// Where the queue manager refused, or the connection broke: the unit
+    /// is then backed out by the queue manager.
+    pub fn back_out(&mut self) -> Result<()> {
+        self.settle(MQBACK)
+    }
+
+    /// Whether a get under syncpoint has opened a unit of work that is
+    /// neither committed nor backed out.
+    #[must_use]
+    pub const fn in_unit(&self) -> bool {
+        self.in_unit
+    }
+
+    fn settle(&mut self, kind: u8) -> Result<()> {
+        let reply = self.call(kind, ApiHeader::call(0).encode().to_vec())?;
+        judge(&ApiHeader::decode(&reply.body)?.0)?;
+        self.in_unit = false;
+        Ok(())
     }
 
     /// Close `handle`.

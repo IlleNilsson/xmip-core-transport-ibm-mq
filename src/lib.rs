@@ -10,17 +10,24 @@
 //! `MQGET`, `MQCLOSE` and `MQDISC`, each with the structures the MQI
 //! declares (`descriptor.rs`) — the message descriptor, the put and get
 //! options, the object descriptor. A Receive Location connects, opens its
-//! queue for input and gets until the queue manager says `2033`, no
-//! message available, each message a Stream with the id MQ gave it; a
-//! Send Location connects, opens for output and puts the Stream as one
-//! datagram. `client.rs` is Xmip's side; `manager.rs` is the queue
+//! queue for input and gets one message a receive under syncpoint, a
+//! Stream with the id MQ gave it; an empty queue is waited on by the queue
+//! manager for the `wait` setting (`MQGMO_WAIT`, [`DEFAULT_WAIT`]), a
+//! message put meanwhile got at once, and `2033`, no message available,
+//! after it is an empty receive, so an idle Location never spins; each
+//! message is its own unit of work, and its own
+//! verdict settles it: `MQCMIT` takes it off the queue once the runtime
+//! accepted or refused it, `MQBACK` puts it back where the cycle failed
+//! ([`unit`]). A Send Location connects, opens for output and puts the
+//! Stream as one datagram. `client.rs` is Xmip's side; `manager.rs` is the queue
 //! manager a test or the playground puts on loopback. No channel exit, no
 //! user identification record and no TLS are spoken; a queue manager that
 //! demands them refuses the connection with its reason, and this transport
 //! says so.
 //!
-//! A message got is gone from the queue, which is the queue's own claim,
-//! so [`Transport::claims`] answers `None`. The ceiling is the queue
+//! A message got under syncpoint is the queue manager's own claim: no
+//! other getter sees it until it is committed or backed out, so
+//! [`Transport::claims`] answers `None`. The ceiling is the queue
 //! manager's `MAXMSGL`, four mebibytes unless it says otherwise in its
 //! initial data, and a Stream over it is refused before a byte is written.
 //!
@@ -37,6 +44,7 @@ pub mod client;
 pub mod descriptor;
 pub mod manager;
 pub mod segment;
+pub mod unit;
 
 use std::net::TcpListener;
 use std::time::Duration;
@@ -48,8 +56,14 @@ use transport::error::{Result, TransportError, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Configured, Directions, Pool, Transport};
+use transport::{Arrived, Configured, Directions, Pool, Taken, Transport};
 use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
+
+/// How long a receive's get waits on an empty queue when the Location
+/// does not say (`wait`): a message put meanwhile is got at once, so the
+/// wait adds nothing to a message's latency, and a Location stopping is
+/// heard within it.
+pub const DEFAULT_WAIT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct IbmMqTransport {
@@ -58,9 +72,15 @@ pub struct IbmMqTransport {
     queue: String,
     channel: String,
     timeout: Option<Duration>,
-    /// The connections a receive gets on and a send puts on, connected once
-    /// per server and queue manager and kept.
+    /// How long a receive's get waits on an empty queue.
+    wait: Duration,
+    /// The connections a send puts on, connected once per server and queue
+    /// manager and kept.
     connections: Pool<Client>,
+    /// The connection a receive gets on, under syncpoint, and its unit of
+    /// work is settled on: a pool of its own, so no put ever takes the
+    /// connection a unit is open on.
+    receivers: Pool<Client>,
 }
 
 impl IbmMqTransport {
@@ -77,8 +97,18 @@ impl IbmMqTransport {
             queue: queue.into(),
             channel: DEFAULT_CHANNEL.to_string(),
             timeout: None,
+            wait: DEFAULT_WAIT,
             connections: Pool::new(),
+            receivers: Pool::new(),
         }
+    }
+
+    /// Wait `wait` on an empty queue in a receive's get, rather than
+    /// [`DEFAULT_WAIT`]; zero answers at once.
+    #[must_use]
+    pub const fn waiting(mut self, wait: Duration) -> Self {
+        self.wait = wait;
+        self
     }
 
     /// Connect on `channel` rather than `SYSTEM.DEF.SVRCONN`.
@@ -162,28 +192,44 @@ impl Transport for IbmMqTransport {
         Directions::BOTH
     }
 
-    /// Get every message waiting on the queue, oldest first, on the
-    /// connection kept for the queue manager and made on the first receive.
+    fn arrivals(&self) -> transport::Arrivals {
+        transport::Arrivals::Ordered(
+            "a message is got under syncpoint on the connection its unit is settled on",
+        )
+    }
+
+    /// Get the oldest message on the queue under syncpoint — one, or none
+    /// where the queue is empty — on the connection kept for receiving and
+    /// made on the first receive. A connection holds one unit of work, and
+    /// MQ settles it whole, so a receive gets one message and that message
+    /// is the unit: nothing leaves the queue here, and its verdict commits
+    /// it or backs it out alone ([`unit`]), so a failed message never puts
+    /// an accepted one back. A unit an earlier receive left without its
+    /// verdict is backed out first, so its message is got again.
     fn receive(&self) -> Result<Vec<Arrived>> {
         let origin = Self::origin(&self.server, &self.queue_manager, &self.queue);
-        self.connections.exchange(
-            &format!("{}/{}", self.server, self.queue_manager),
+        let key = format!("{}/{}", self.server, self.queue_manager);
+        let got = self.receivers.exchange(
+            &key,
             || self.connect(),
             |client| {
+                if client.in_unit() {
+                    client.back_out()?;
+                }
                 let handle = client.held(
                     &self.queue,
                     descriptor::OPEN_INPUT | descriptor::OPEN_FAIL_IF_QUIESCING,
                 )?;
-                let mut arrived = Vec::new();
-                while let Some((id, bytes)) = client.get(handle)? {
-                    arrived.push(Arrived::new(
-                        format!("{origin}{}", codec::hex::encode(&id)),
-                        bytes,
-                    ));
-                }
-                Ok(arrived)
+                client.get(handle, self.wait)
             },
-        )
+        )?;
+        Ok(got
+            .into_iter()
+            .map(|(id, bytes)| {
+                let origin = format!("{origin}{}", codec::hex::encode(&id));
+                Arrived::whole(origin, bytes, unit::acknowledgement(&self.receivers, &key))
+            })
+            .collect())
     }
 
     /// Put the bytes as one message on the queue the target names, on the
@@ -240,6 +286,14 @@ impl Configured for IbmMqTransport {
                           unbounded when left out.",
                 applies: Applies::Both,
             },
+            Setting {
+                name: "wait",
+                kind: Kind::Duration,
+                presence: Presence::Default(Fixed::Duration(DEFAULT_WAIT)),
+                meaning: "How long a receive waits on an empty queue for a message to be put \
+                          (MQGMO_WAIT); zero answers at once.",
+                applies: Applies::Receive,
+            },
         ],
     };
 
@@ -251,7 +305,8 @@ impl Configured for IbmMqTransport {
             settings.text("queue_manager"),
             settings.optional_text("queue").unwrap_or_default(),
         )
-        .on_channel(settings.text("channel"));
+        .on_channel(settings.text("channel"))
+        .waiting(settings.optional_duration("wait").unwrap_or(DEFAULT_WAIT));
         Ok(match settings.optional_duration("timeout") {
             Some(timeout) => transport.timing_out_after(timeout),
             None => transport,
@@ -270,7 +325,7 @@ impl IbmMqTransport {
 }
 
 impl Accepting for IbmMqTransport {
-    fn take_one(self, listener: &TcpListener) -> Result<Arrived> {
+    fn take_one(self, listener: &TcpListener) -> Result<Taken> {
         let mut session = self.accept_one(listener, &[])?;
         let put = session
             .next_put()?
@@ -306,6 +361,7 @@ impl Loopback for IbmMqTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use transport::arrived::next_arrival;
     use transport::payload::edge_payloads;
 
     fn secs(n: u64) -> Duration {
@@ -327,6 +383,14 @@ mod tests {
         assert_eq!(built.queue, "ORDERS");
         assert_eq!(built.channel, DEFAULT_CHANNEL);
         assert_eq!(built.timeout, Some(secs(15)));
+        assert_eq!(built.wait, DEFAULT_WAIT);
+        let given = [
+            given[0].clone(),
+            given[1].clone(),
+            ("wait".to_string(), Given::Text("250ms".to_string())),
+        ];
+        let waiting = IbmMqTransport::open("mq.example:1414", Applies::Receive, &given);
+        assert_eq!(waiting.expect("built").wait, Duration::from_millis(250));
         let Err(refused) = IbmMqTransport::open("mq.example:1414", Applies::Send, &given[1..2])
         else {
             panic!("a Send Location's queue manager is required, and it names no queue");
@@ -348,8 +412,9 @@ mod tests {
             .collect();
         let sent = long.clone();
         let sender = std::thread::spawn(move || {
-            let near =
-                IbmMqTransport::new(address.clone(), "QM1", "ORDERS").timing_out_after(secs(2));
+            let near = IbmMqTransport::new(address.clone(), "QM1", "ORDERS")
+                .timing_out_after(secs(2))
+                .waiting(Duration::ZERO);
             near.send(&format!("ibm-mq://{address}/QM1/ORDERS"), b"order\0\xff")?;
             near.send("ORDERS", &sent)?;
             near.send("ORDERS", b"")?;
@@ -382,13 +447,22 @@ mod tests {
     }
 
     #[test]
-    fn a_receive_gets_every_message_oldest_first_until_the_queue_is_empty() {
+    fn a_receive_gets_one_message_oldest_first_each_its_own_unit() {
         let far_end = IbmMqTransport::new("127.0.0.1:0", "QM1", "ORDERS").timing_out_after(secs(2));
         let (listener, address) = far_end.bind().expect("binding");
         let receiver = std::thread::spawn(move || {
-            IbmMqTransport::new(address, "QM1", "ORDERS")
+            let near = IbmMqTransport::new(address, "QM1", "ORDERS")
                 .timing_out_after(secs(2))
-                .receive()
+                .waiting(Duration::ZERO);
+            let mut taken = Vec::new();
+            for _ in 0..3 {
+                let arrived = near.receive()?;
+                assert!(arrived.len() <= 1, "one message a receive");
+                for one in arrived {
+                    taken.push(one.taken()?);
+                }
+            }
+            Ok::<_, TransportError>(taken)
         });
         let mut session = far_end
             .accept_one(&listener, &[b"first", b"\x00second\xff"])
@@ -397,14 +471,22 @@ mod tests {
         while let Some(event) = session.next_event().expect("event") {
             events.push(event);
         }
-        assert_eq!(
-            events.iter().filter(|e| matches!(e, Event::Got(_))).count(),
-            3,
-            "two, then 2033"
-        );
+        let gets_and_settles: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, Event::Got(_) | Event::Committed | Event::BackedOut))
+            .collect();
         assert!(
-            matches!(events.last(), Some(Event::Got(_))),
-            "the connection and the queue kept open: {events:?}"
+            matches!(
+                gets_and_settles[..],
+                [
+                    Event::Got(_),
+                    Event::Committed,
+                    Event::Got(_),
+                    Event::Committed,
+                    Event::Got(_)
+                ]
+            ),
+            "a get and its commit, a get and its commit, then 2033: {events:?}"
         );
         let arrived = receiver.join().expect("thread").expect("receiving");
         assert_eq!(arrived.len(), 2);
@@ -412,7 +494,7 @@ mod tests {
         assert_eq!(arrived[1].bytes, b"\x00second\xff");
         assert!(arrived[0].origin_uri.starts_with("ibm-mq://127.0.0.1:"));
         assert!(arrived[0].origin_uri.contains("/QM1/ORDERS?msgid=414d5120"));
-        assert!(session.queue("ORDERS").is_empty(), "got is gone");
+        assert!(session.queue("ORDERS").is_empty(), "committed is gone");
     }
 
     #[test]
@@ -420,7 +502,9 @@ mod tests {
         const RECEIVES: usize = 1000;
         let far_end = IbmMqTransport::new("127.0.0.1:0", "QM1", "ORDERS").timing_out_after(secs(5));
         let (listener, address) = far_end.bind().expect("binding");
-        let near = IbmMqTransport::new(address, "QM1", "ORDERS").timing_out_after(secs(5));
+        let near = IbmMqTransport::new(address, "QM1", "ORDERS")
+            .timing_out_after(secs(5))
+            .waiting(Duration::ZERO);
         let receiving = near.clone();
         let receiver = std::thread::spawn(move || {
             let began = std::time::Instant::now();
@@ -453,11 +537,159 @@ mod tests {
         let mut again = far_end
             .accept_one(&listener, &[b"after"])
             .expect("a new connection");
-        // The one message, then the get that finds the queue empty.
-        serve(&mut again, 2);
+        // The one message: one get.
+        serve(&mut again, 1);
         let arrived = receiver.join().expect("thread").expect("received");
-        assert_eq!(arrived[0].bytes, b"after");
-        assert_eq!(near.connections.opened(), 2);
+        // Read, not acknowledged: the queue manager is no longer served.
+        let (_, mut body, _) = arrived.into_iter().next().expect("one").into_parts();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut body, &mut bytes).expect("read");
+        assert_eq!(bytes, b"after");
+        assert_eq!(near.receivers.opened(), 2);
+    }
+
+    #[test]
+    fn accepted_and_refused_commit_their_own_unit_and_only_the_failed_one_is_got_again() {
+        let far_end = IbmMqTransport::new("127.0.0.1:0", "QM1", "ORDERS").timing_out_after(secs(2));
+        let (listener, address) = far_end.bind().expect("binding");
+        let receiver = std::thread::spawn(move || {
+            let near = IbmMqTransport::new(address, "QM1", "ORDERS")
+                .timing_out_after(secs(2))
+                .waiting(Duration::ZERO);
+            let one = next_arrival(near.receive()?, "one")?;
+            assert!(one.defers());
+            let one = one.taken()?;
+            next_arrival(near.receive()?, "two")?.refused(transport::Refusal::Unacceptable)?;
+            next_arrival(near.receive()?, "three")?.failed()?;
+            let again = next_arrival(near.receive()?, "three again")?.taken()?;
+            Ok::<_, TransportError>([one.bytes, again.bytes])
+        });
+        let mut session = far_end
+            .accept_one(&listener, &[b"one", b"two", b"three"])
+            .expect("accepting");
+        let mut settled = Vec::new();
+        while let Some(event) = session.next_event().expect("event") {
+            if matches!(event, Event::Committed | Event::BackedOut) {
+                settled.push(event);
+            }
+        }
+        let taken = receiver.join().expect("thread").expect("receiving");
+        // Each its own unit: accepted and refused committed, the failed one
+        // alone backed out, got again and committed.
+        assert_eq!(
+            settled,
+            [
+                Event::Committed,
+                Event::Committed,
+                Event::BackedOut,
+                Event::Committed
+            ]
+        );
+        assert_eq!(taken, [b"one".to_vec(), b"three".to_vec()]);
+        assert!(session.queue("ORDERS").is_empty());
+    }
+
+    #[test]
+    fn a_thousand_messages_each_its_own_unit_commit_under_a_millisecond_each() {
+        const MESSAGES: usize = 1000;
+        let far_end = IbmMqTransport::new("127.0.0.1:0", "QM1", "ORDERS").timing_out_after(secs(5));
+        let (listener, address) = far_end.bind().expect("binding");
+        let receiver = std::thread::spawn(move || {
+            let near = IbmMqTransport::new(address, "QM1", "ORDERS")
+                .timing_out_after(secs(5))
+                .waiting(Duration::ZERO);
+            let mut committing = Duration::ZERO;
+            for _ in 0..MESSAGES {
+                let (_, _, acknowledgement) = next_arrival(near.receive()?, "one")?.into_parts();
+                let began = std::time::Instant::now();
+                acknowledgement.acknowledge(transport::Verdict::Accepted)?;
+                committing += began.elapsed();
+            }
+            Ok::<_, TransportError>(committing)
+        });
+        let messages = vec![&b"m"[..]; MESSAGES];
+        let mut session = far_end.accept_one(&listener, &messages).expect("accepting");
+        let mut commits = 0;
+        while commits < MESSAGES {
+            if session.next_event().expect("event") == Some(Event::Committed) {
+                commits += 1;
+            }
+        }
+        let committing = receiver.join().expect("thread").expect("receiving");
+        // The commit each message's own unit adds: one MQCMIT and its reply,
+        // a quarter of a millisecond on loopback; generous for a debug build
+        // under load, a millisecond each.
+        assert!(
+            committing < Duration::from_millis(MESSAGES as u64),
+            "{committing:?}"
+        );
+        assert!(session.queue("ORDERS").is_empty());
+    }
+
+    #[test]
+    fn an_empty_queue_is_waited_on_and_a_message_put_meanwhile_is_got_at_once() {
+        const WAIT: Duration = Duration::from_millis(300);
+        let far_end = IbmMqTransport::new("127.0.0.1:0", "QM1", "ORDERS").timing_out_after(secs(5));
+        let (listener, address) = far_end.bind().expect("binding");
+        let (asked, waiting) = std::sync::mpsc::channel();
+        let receiver = std::thread::spawn(move || {
+            let near = IbmMqTransport::new(address, "QM1", "ORDERS")
+                .timing_out_after(secs(5))
+                .waiting(WAIT);
+            // Nothing is put: the get waits its interval, then is empty.
+            let began = std::time::Instant::now();
+            let empty = near.receive()?;
+            let waited = began.elapsed();
+            // Something is put while the next get waits: got at once.
+            asked.send(()).expect("told");
+            let began = std::time::Instant::now();
+            let got = next_arrival(near.receive()?, "put while waiting")?.taken()?;
+            Ok::<_, TransportError>((empty.len(), waited, got.bytes, began.elapsed()))
+        });
+        let mut session = far_end.accept_one(&listener, &[]).expect("accepting");
+        let putting = session.putting();
+        let putter = std::thread::spawn(move || {
+            waiting.recv().expect("asked");
+            putting
+                .send(("ORDERS".to_string(), b"C1".to_vec()))
+                .expect("put");
+        });
+        while session.next_event().expect("event").is_some() {}
+        putter.join().expect("putter");
+        let (empty, waited, got, took) = receiver.join().expect("thread").expect("receiving");
+        assert_eq!(empty, 0, "2033 after the wait is an empty receive");
+        assert!(waited >= WAIT, "the queue manager waited: {waited:?}");
+        assert!(waited < WAIT * 3, "and no longer: {waited:?}");
+        assert_eq!(got, b"C1");
+        assert!(took < WAIT, "a put ends the wait: {took:?}");
+    }
+
+    #[test]
+    fn a_unit_left_without_every_verdict_is_backed_out_by_the_next_receive() {
+        let far_end = IbmMqTransport::new("127.0.0.1:0", "QM1", "ORDERS").timing_out_after(secs(2));
+        let (listener, address) = far_end.bind().expect("binding");
+        let receiver = std::thread::spawn(move || {
+            let near = IbmMqTransport::new(address, "QM1", "ORDERS")
+                .timing_out_after(secs(2))
+                .waiting(Duration::ZERO);
+            drop(near.receive()?);
+            let again = near.receive()?;
+            Ok::<_, TransportError>(again.len())
+        });
+        let mut session = far_end.accept_one(&listener, &[b"one"]).expect("accepting");
+        let mut settled = Vec::new();
+        while let Some(event) = session.next_event().expect("event") {
+            if matches!(event, Event::Committed | Event::BackedOut) {
+                settled.push(event);
+            }
+        }
+        assert_eq!(receiver.join().expect("thread").expect("receiving"), 1);
+        assert_eq!(
+            settled,
+            [Event::BackedOut],
+            "and the second unit at the close"
+        );
+        assert_eq!(session.queue("ORDERS"), [b"one".to_vec()], "never lost");
     }
 
     #[test]
@@ -465,7 +697,9 @@ mod tests {
         const SENDS: usize = 1000;
         let far_end = IbmMqTransport::new("127.0.0.1:0", "QM1", "ORDERS").timing_out_after(secs(5));
         let (listener, address) = far_end.bind().expect("binding");
-        let near = IbmMqTransport::new(address, "QM1", "ORDERS").timing_out_after(secs(5));
+        let near = IbmMqTransport::new(address, "QM1", "ORDERS")
+            .timing_out_after(secs(5))
+            .waiting(Duration::ZERO);
         let sending = near.clone();
         let sender = std::thread::spawn(move || {
             let began = std::time::Instant::now();
@@ -498,8 +732,9 @@ mod tests {
         let far_end = IbmMqTransport::new("127.0.0.1:0", "QM1", "ORDERS").timing_out_after(secs(2));
         let (listener, address) = far_end.bind().expect("binding");
         let sender = std::thread::spawn(move || {
-            let near =
-                IbmMqTransport::new(address.clone(), "QM1", "ORDERS").timing_out_after(secs(2));
+            let near = IbmMqTransport::new(address.clone(), "QM1", "ORDERS")
+                .timing_out_after(secs(2))
+                .waiting(Duration::ZERO);
             let wrong = near.send("QM9/ORDERS", b"x");
             let unknown = near.send("NOWHERE", b"x");
             let big = QueueManager::new("QM1");
@@ -534,7 +769,10 @@ mod tests {
         let mq = IbmMqTransport::new("host:1414", "QM1", "ORDERS").on_channel("XMIP.SVRCONN");
         assert_eq!(mq.name(), "ibm-mq");
         assert_eq!(mq.directions(), Directions::BOTH);
-        assert!(mq.claims().is_none(), "a got message is gone");
+        assert!(
+            mq.claims().is_none(),
+            "a got message is the queue manager's"
+        );
         assert_eq!(mq.channel, "XMIP.SVRCONN");
         assert_eq!(
             mq.resolve("mq://other:1414/QM2/Q").expect("full"),

@@ -6,16 +6,22 @@
 //! handles on `MQOPEN`, appends on `MQPUT` and takes from the front on
 //! `MQGET`, each reply with MQ's completion and reason codes — `2058` for
 //! the wrong queue manager, `2085` for a queue it does not have, `2033`
-//! for an empty one. Persistence, channels, security exits and clustering
-//! are a queue manager's.
+//! for an empty one — at once, or under `MQGMO_WAIT` once its wait
+//! interval is over, a message put meanwhile through [`Session::putting`]
+//! answering it at once. A get under syncpoint is held in the conversation's
+//! unit of work: `MQCMIT` and `MQDISC` let it go, `MQBACK` and a
+//! connection that breaks put it back at the front of its queue.
+//! Persistence, channels, security exits and clustering are a queue
+//! manager's.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use codec::hex;
-use transport::Arrived;
+use transport::Taken;
 use transport::error::{Result, protocol_error};
 use transport::socket;
 
@@ -24,12 +30,12 @@ use crate::client::{
     UNKNOWN_OBJECT,
 };
 use crate::descriptor::{
-    InitialData, MQPMO_LENGTH, MessageDescriptor, decode_object, decode_options,
-    encode_get_options, fixed, text_of,
+    GET_SYNCPOINT, GET_WAIT, InitialData, MQPMO_LENGTH, MessageDescriptor, decode_object,
+    decode_options, encode_get_options, fixed, get_options_of, text_of,
 };
 use crate::segment::{
-    ApiHeader, INITIAL_DATA, MQCLOSE, MQCONN, MQDISC, MQGET, MQOPEN, MQPUT, Segment, read_segment,
-    write_segment,
+    ApiHeader, INITIAL_DATA, MQBACK, MQCLOSE, MQCMIT, MQCONN, MQDISC, MQGET, MQOPEN, MQPUT,
+    Segment, read_segment, write_segment,
 };
 
 /// What the client did, as [`Session::next_event`] reports it.
@@ -39,10 +45,15 @@ pub enum Event {
     Connected,
     /// The client opened this queue.
     Opened(String),
-    /// The client put one message; here is the Stream.
-    Put(Arrived),
+    /// The client put one message; here is what it put.
+    Put(Taken),
     /// The client got from this queue, or found it empty.
     Got(String),
+    /// The client committed its unit of work: what it got is gone.
+    Committed,
+    /// The client backed out its unit of work, or its connection broke:
+    /// what it got is back on its queue.
+    BackedOut,
     /// The client closed a handle.
     Closed,
     /// The client disconnected.
@@ -121,27 +132,47 @@ impl QueueManager {
                 mine.encode(),
             ),
         )?;
+        let (putting, arriving) = channel();
         Ok(Session {
             manager: self,
+            putting,
+            arriving,
             reader,
             writer,
             handles: BTreeMap::new(),
             next_handle: 2,
             next_id: 1,
+            unit: Vec::new(),
         })
     }
 }
 
 pub struct Session {
     manager: QueueManager,
+    /// Messages put by another application while this conversation is
+    /// served ([`Session::putting`]): taken onto their queue before a get,
+    /// and what a waiting get waits on.
+    putting: Sender<(String, Vec<u8>)>,
+    arriving: Receiver<(String, Vec<u8>)>,
     reader: BufReader<TcpStream>,
     writer: TcpStream,
     handles: BTreeMap<u32, String>,
     next_handle: u32,
     next_id: u32,
+    /// What was got under syncpoint and not yet committed: each queue and
+    /// message, oldest first.
+    unit: Vec<(String, Vec<u8>)>,
 }
 
 impl Session {
+    /// Where another application puts a message — a queue and its bytes —
+    /// while this conversation is served: a get waiting on an empty queue
+    /// (`MQGMO_WAIT`) is answered with it at once.
+    #[must_use]
+    pub fn putting(&self) -> Sender<(String, Vec<u8>)> {
+        self.putting.clone()
+    }
+
     /// What `queue` holds now, oldest first.
     #[must_use]
     pub fn queue(&self, queue: &str) -> Vec<Vec<u8>> {
@@ -156,7 +187,7 @@ impl Session {
     ///
     /// # Errors
     /// As [`Session::next_event`].
-    pub fn next_put(&mut self) -> Result<Option<Arrived>> {
+    pub fn next_put(&mut self) -> Result<Option<Taken>> {
         loop {
             match self.next_event()? {
                 Some(Event::Put(arrived)) => return Ok(Some(arrived)),
@@ -173,6 +204,8 @@ impl Session {
     /// does not take.
     pub fn next_event(&mut self) -> Result<Option<Event>> {
         let Some(segment) = read_segment(&mut self.reader)? else {
+            // A connection that ends with a unit of work open backs it out.
+            self.back_out();
             return Ok(None);
         };
         let (header, rest) = ApiHeader::decode(&segment.body)?;
@@ -180,7 +213,15 @@ impl Session {
             MQCONN => self.connect(rest),
             MQOPEN => self.open(rest),
             MQPUT => self.put(header.handle, rest),
-            MQGET => self.get(header.handle),
+            MQGET => self.get(header.handle, rest),
+            MQCMIT => {
+                self.unit.clear();
+                (ApiHeader::call(0).encode().to_vec(), Event::Committed)
+            }
+            MQBACK => {
+                self.back_out();
+                (ApiHeader::call(0).encode().to_vec(), Event::BackedOut)
+            }
             MQCLOSE => {
                 self.handles.remove(&header.handle);
                 (
@@ -188,7 +229,11 @@ impl Session {
                     Event::Closed,
                 )
             }
-            MQDISC => (ApiHeader::call(0).encode().to_vec(), Event::Disconnected),
+            MQDISC => {
+                // A disconnect commits, as MQ does off z/OS.
+                self.unit.clear();
+                (ApiHeader::call(0).encode().to_vec(), Event::Disconnected)
+            }
             other => return Err(protocol_error(format!("a {other:#04x} segment"))),
         };
         write_segment(&mut self.writer, &segment.reply(reply))?;
@@ -246,13 +291,28 @@ impl Session {
         );
         let mut reply = ApiHeader::call(handle).encode().to_vec();
         reply.extend_from_slice(&descriptor.encode());
-        (reply, Event::Put(Arrived::new(origin, bytes)))
+        (reply, Event::Put(Taken::new(origin, bytes)))
     }
 
-    fn get(&mut self, handle: u32) -> (Vec<u8>, Event) {
+    fn get(&mut self, handle: u32, body: &[u8]) -> (Vec<u8>, Event) {
         let Some(queue) = self.handles.get(&handle).cloned() else {
             return refused(HANDLE_ERROR, handle);
         };
+        let Ok((options, wait)) =
+            MessageDescriptor::decode(body).and_then(|(_, rest)| get_options_of(rest))
+        else {
+            return refused(HANDLE_ERROR, handle);
+        };
+        while let Ok(put) = self.arriving.try_recv() {
+            self.arrived(put);
+        }
+        if options & GET_WAIT != 0 && self.queue(&queue).is_empty() {
+            // Waited on until a message is put or the interval is over.
+            let interval = Duration::from_millis(u64::from(wait));
+            if let Ok(put) = self.arriving.recv_timeout(interval) {
+                self.arrived(put);
+            }
+        }
         let Some(bytes) = self
             .manager
             .queues
@@ -268,9 +328,29 @@ impl Session {
         descriptor.message_id = self.message_id();
         let mut reply = ApiHeader::call(handle).encode().to_vec();
         reply.extend_from_slice(&descriptor.encode());
-        reply.extend_from_slice(&encode_get_options(&queue, bytes.len()));
+        reply.extend_from_slice(&encode_get_options(&queue, options, wait, bytes.len()));
         reply.extend_from_slice(&bytes);
+        if options & GET_SYNCPOINT != 0 {
+            self.unit.push((queue.clone(), bytes));
+        }
         (reply, Event::Got(queue))
+    }
+
+    /// A message another application put, at the back of its queue.
+    fn arrived(&mut self, (queue, bytes): (String, Vec<u8>)) {
+        if let Some(held) = self.manager.queues.get_mut(&queue) {
+            held.push_back(bytes);
+        }
+    }
+
+    /// Every message of the open unit of work back at the front of its
+    /// queue, in the order it was got.
+    fn back_out(&mut self) {
+        for (queue, bytes) in self.unit.drain(..).rev() {
+            if let Some(held) = self.manager.queues.get_mut(&queue) {
+                held.push_front(bytes);
+            }
+        }
     }
 
     /// `AMQ `, the queue manager's name, and a number no message here
