@@ -24,6 +24,15 @@ pub const OPEN_INPUT: u32 = 0x0000_0001;
 pub const OPEN_OUTPUT: u32 = 0x0000_0010;
 /// `MQOO_FAIL_IF_QUIESCING`.
 pub const OPEN_FAIL_IF_QUIESCING: u32 = 0x0000_2000;
+/// `MQGMO_SYNCPOINT`: the get is part of the connection's unit of work,
+/// and the message leaves the queue only when it is committed.
+pub const GET_SYNCPOINT: u32 = 0x0000_0002;
+/// `MQGMO_FAIL_IF_QUIESCING`.
+pub const GET_FAIL_IF_QUIESCING: u32 = 0x0000_2000;
+/// `MQGMO_WAIT`: an empty queue is waited on for the get options' wait
+/// interval, and a message put meanwhile is got at once; `2033` comes only
+/// once the interval is over.
+pub const GET_WAIT: u32 = 0x0000_0001;
 /// `MQMT_DATAGRAM`.
 const DATAGRAM: u32 = 8;
 /// The level of the format and protocol this crate speaks.
@@ -154,15 +163,21 @@ pub fn encode_put_options(resolved_queue: &str, data_length: usize) -> Vec<u8> {
     out
 }
 
-/// The get message options, `MQGMO` version 1, and the buffer length that
-/// follows them on the wire.
+/// The get message options, `MQGMO` version 1, with `options` and the
+/// wait interval in milliseconds `wait` (read only under [`GET_WAIT`]), and
+/// the buffer length that follows them on the wire.
 #[must_use]
-pub fn encode_get_options(resolved_queue: &str, buffer_length: usize) -> Vec<u8> {
+pub fn encode_get_options(
+    resolved_queue: &str,
+    options: u32,
+    wait: u32,
+    buffer_length: usize,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(MQGMO_LENGTH + 4);
     out.extend_from_slice(b"GMO ");
     out.extend_from_slice(&1u32.to_be_bytes());
-    out.extend_from_slice(&0x0000_2000u32.to_be_bytes());
-    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&options.to_be_bytes());
+    out.extend_from_slice(&wait.to_be_bytes());
     out.extend_from_slice(&0u32.to_be_bytes());
     out.extend_from_slice(&0u32.to_be_bytes());
     out.extend_from_slice(&fixed(resolved_queue, 48));
@@ -187,6 +202,16 @@ pub fn decode_options<'a>(
     eyecatcher(bytes, *catcher, length)?;
     let declared = be32(field(bytes, length, 4)?) as usize;
     Ok((declared, &bytes[length + 4..]))
+}
+
+/// The options and the wait interval in milliseconds of the get message
+/// options at the start of `bytes`.
+///
+/// # Errors
+/// Where the bytes are not get message options.
+pub fn get_options_of(bytes: &[u8]) -> Result<(u32, u32)> {
+    eyecatcher(bytes, *b"GMO ", MQGMO_LENGTH)?;
+    Ok((be32(field(bytes, 8, 4)?), be32(field(bytes, 12, 4)?)))
 }
 
 /// The object descriptor, `MQOD` version 1: a queue by name.
@@ -281,8 +306,9 @@ mod tests {
             decode_options(&pmo, b"PMO ", MQPMO_LENGTH).expect("pmo").0,
             5
         );
-        let gmo = encode_get_options("", 4096);
+        let gmo = encode_get_options("", GET_SYNCPOINT | GET_WAIT, 1500, 4096);
         assert_eq!(gmo.len(), MQGMO_LENGTH + 4);
+        assert_eq!(get_options_of(&gmo).expect("options"), (0x0003, 1500));
         assert_eq!(
             decode_options(&gmo, b"GMO ", MQGMO_LENGTH).expect("gmo").0,
             4096
