@@ -8,6 +8,10 @@ A receive gets one message under syncpoint and waits on an empty queue: `MQGMO_W
 
 A send target is read by `net::Target` in [xmip-core-library-net](https://github.com/IlleNilsson/xmip-core-library-net), the one reading of a URI every technology calls: scheme, authority, path and decoded query. Until 2026-09-28 it was read through the transport capability's `socket::target`, which split it on its first slash and left the query in the path.
 
+## The deduplication key
+
+A keyed send (`Transport::send_keyed`, built 2026-10-04) carries the Journey's identifier as the message descriptor's `MsgId` (`descriptor::message_id_of`): a UUID's sixteen octets then eight zeros, any other key's UTF-8 octets cut or zero-padded to twenty-four, the same on every attempt of one Journey. The put asks no `MQPMO_NEW_MSG_ID`, so the queue manager keeps it as put; a queue manager does not drop a repeated put by it, and a consumer recognises the repeat by its `MsgId` — JMS reads it as `JMSMessageID`, `ID:` and its hex. An unkeyed `send` puts `MQMI_NONE` and the queue manager assigns one, as the in-process `QueueManager` now does too: it kept no id a client put until then.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it

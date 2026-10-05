@@ -279,7 +279,11 @@ impl Session {
         if length > self.manager.max_message as usize || data.len() < length {
             return refused(TOO_BIG, handle);
         }
-        descriptor.message_id = self.message_id();
+        // A put's own id is kept, as a queue manager keeps it without
+        // MQPMO_NEW_MSG_ID; one assigned where it named none.
+        if descriptor.message_id == [0; 24] {
+            descriptor.message_id = self.message_id();
+        }
         let bytes = data[..length].to_vec();
         if let Some(held) = self.manager.queues.get_mut(&queue) {
             held.push_back(bytes.clone());

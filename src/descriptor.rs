@@ -72,6 +72,24 @@ fn eyecatcher(bytes: &[u8], expected: [u8; 4], length: usize) -> Result<()> {
     Ok(())
 }
 
+/// The `MsgId` a keyed put carries: a UUID's sixteen octets, then eight
+/// zeros; any other key's UTF-8 octets, cut or zero-padded to twenty-four.
+/// The same key is the same id, which a consumer recognises a repeated put
+/// by, and which JMS reads as `JMSMessageID`, `ID:` and its hex.
+#[must_use]
+pub fn message_id_of(key: &str) -> [u8; 24] {
+    let mut id = [0u8; 24];
+    let digits: String = key.chars().filter(|c| *c != '-').collect();
+    match codec::hex::decode(&digits) {
+        Ok(octets) if octets.len() == 16 && key.len() == 36 => id[..16].copy_from_slice(&octets),
+        _ => {
+            let octets = &key.as_bytes()[..key.len().min(24)];
+            id[..octets.len()].copy_from_slice(octets);
+        }
+    }
+    id
+}
+
 /// The message descriptor, `MQMD` version 1.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessageDescriptor {
@@ -90,6 +108,19 @@ impl MessageDescriptor {
             correlation_id: [0; 24],
             format: String::new(),
             put_application: put_application.to_string(),
+        }
+    }
+
+    /// This descriptor, with `key` as its message id ([`message_id_of`])
+    /// where there is one; without, the queue manager assigns one.
+    #[must_use]
+    pub fn keyed(self, key: Option<&str>) -> Self {
+        match key {
+            Some(key) => Self {
+                message_id: message_id_of(key),
+                ..self
+            },
+            None => self,
         }
     }
 

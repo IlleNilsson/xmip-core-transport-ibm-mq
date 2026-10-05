@@ -235,6 +235,19 @@ impl Transport for IbmMqTransport {
     /// Put the bytes as one message on the queue the target names, on the
     /// connection kept for its queue manager and made on the first send.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
+        self.put(target, bytes, None)
+    }
+
+    /// The key goes in the message descriptor's `MsgId`
+    /// ([`descriptor::message_id_of`]), kept by the queue manager as put.
+    fn send_keyed(&self, target: &str, bytes: &[u8], key: &str) -> Result<()> {
+        self.put(target, bytes, Some(key))
+    }
+}
+
+impl IbmMqTransport {
+    /// The one send, on the connection kept for the target's queue manager.
+    fn put(&self, target: &str, bytes: &[u8], key: Option<&str>) -> Result<()> {
         let (server, queue_manager, queue) = self.resolve(target)?;
         self.connections.exchange(
             &format!("{server}/{queue_manager}"),
@@ -244,7 +257,7 @@ impl Transport for IbmMqTransport {
                     queue,
                     descriptor::OPEN_OUTPUT | descriptor::OPEN_FAIL_IF_QUIESCING,
                 )?;
-                client.put(handle, bytes).map(|_| ())
+                client.put(handle, bytes, key).map(|_| ())
             },
         )
     }
@@ -741,7 +754,7 @@ mod tests {
             drop(big);
             let mut client = near.connect()?;
             let handle = client.open("ORDERS", descriptor::OPEN_OUTPUT)?;
-            let too_big = client.put(handle, &[0u8; 101]);
+            let too_big = client.put(handle, &[0u8; 101], None);
             client.disconnect()?;
             Ok::<_, TransportError>((wrong, unknown, too_big, near.send("only/three/parts", b"")))
         });
