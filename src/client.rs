@@ -147,12 +147,13 @@ impl Client {
         Ok(handle)
     }
 
-    /// Put `bytes` as one message on `handle`, and take the id assigned.
+    /// Put `bytes` as one message on `handle`, under `key` as its message
+    /// id where there is one, and take the id the message carries.
     ///
     /// # Errors
     /// Where the message is over what was agreed, or the queue manager
     /// refused.
-    pub fn put(&mut self, handle: u32, bytes: &[u8]) -> Result<[u8; 24]> {
+    pub fn put(&mut self, handle: u32, bytes: &[u8], key: Option<&str>) -> Result<[u8; 24]> {
         ceiling::within(
             bytes.len(),
             self.max_message as usize,
@@ -160,7 +161,7 @@ impl Client {
         )
         .map_err(|refused| reason_error(TOO_BIG, &refused.message))?;
         let mut body = ApiHeader::call(handle).encode().to_vec();
-        body.extend_from_slice(&MessageDescriptor::datagram("xmip").encode());
+        body.extend_from_slice(&MessageDescriptor::datagram("xmip").keyed(key).encode());
         body.extend_from_slice(&encode_put_options("", bytes.len()));
         body.extend_from_slice(bytes);
         let reply = self.call(MQPUT, body)?;
