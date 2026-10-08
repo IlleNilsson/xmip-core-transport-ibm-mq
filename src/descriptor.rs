@@ -96,6 +96,9 @@ pub struct MessageDescriptor {
     pub message_id: [u8; 24],
     pub correlation_id: [u8; 24],
     pub format: String,
+    /// `UserIdentifier`: who put the message, as the queue manager
+    /// recorded it, blank where it recorded no one.
+    pub user_identifier: String,
     pub put_application: String,
 }
 
@@ -107,6 +110,7 @@ impl MessageDescriptor {
             message_id: [0; 24],
             correlation_id: [0; 24],
             format: String::new(),
+            user_identifier: String::new(),
             put_application: put_application.to_string(),
         }
     }
@@ -143,7 +147,7 @@ impl MessageDescriptor {
         out.extend_from_slice(&0u32.to_be_bytes());
         out.extend_from_slice(&fixed("", 48));
         out.extend_from_slice(&fixed("", 48));
-        out.extend_from_slice(&fixed("", 12));
+        out.extend_from_slice(&fixed(&self.user_identifier, 12));
         out.extend_from_slice(&[0u8; 32]);
         out.extend_from_slice(&fixed("", 32));
         out.extend_from_slice(&0u32.to_be_bytes());
@@ -170,6 +174,7 @@ impl MessageDescriptor {
                 message_id,
                 correlation_id,
                 format: text_of(field(bytes, 32, 8)?),
+                user_identifier: text_of(field(bytes, 196, 12)?),
                 put_application: text_of(field(bytes, 276, 28)?),
             },
             &bytes[MQMD_LENGTH..],
@@ -325,6 +330,7 @@ mod tests {
         let mut md = MessageDescriptor::datagram("xmip");
         md.message_id[0] = 0x41;
         md.format = "MQSTR".to_string();
+        md.user_identifier = "c1".to_string();
         let encoded = md.encode();
         assert_eq!(encoded.len(), MQMD_LENGTH);
         let trailing = [encoded, b"x".to_vec()].concat();

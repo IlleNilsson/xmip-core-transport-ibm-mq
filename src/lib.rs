@@ -50,8 +50,10 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 pub use client::{Client, DEFAULT_CHANNEL, DEFAULT_MAX_MESSAGE};
+use context::property::IBM_MQ_USER_IDENTIFIER;
 pub use manager::{Event, QueueManager, Session};
 use net::Target;
+use transport::ArrivalIdentity;
 use transport::error::{Result, TransportError, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
@@ -225,9 +227,15 @@ impl Transport for IbmMqTransport {
         )?;
         Ok(got
             .into_iter()
-            .map(|(id, bytes)| {
-                let origin = format!("{origin}{}", codec::hex::encode(&id));
-                Arrived::whole(origin, bytes, unit::acknowledgement(&self.receivers, &key))
+            .map(|(descriptor, bytes)| {
+                let origin = format!("{origin}{}", codec::hex::encode(&descriptor.message_id));
+                let arrived =
+                    Arrived::whole(origin, bytes, unit::acknowledgement(&self.receivers, &key))
+                        .detected();
+                match descriptor.user_identifier.as_str() {
+                    "" => arrived,
+                    user => arrived.observing(IBM_MQ_USER_IDENTIFIER, user),
+                }
             })
             .collect())
     }
@@ -351,6 +359,12 @@ impl Accepting for IbmMqTransport {
 }
 
 impl Loopback for IbmMqTransport {
+    fn arrival_identity(&self) -> ArrivalIdentity {
+        ArrivalIdentity::Unnamed(
+            "the queue manager delivers it: its UserIdentifier says who put it",
+        )
+    }
+
     /// `MAXMSGL` as MQ ships it: four mebibytes, what the two sides agree
     /// on when neither says otherwise.
     fn ceiling(&self) -> Option<usize> {
