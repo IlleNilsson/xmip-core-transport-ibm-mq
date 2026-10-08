@@ -183,7 +183,11 @@ impl Client {
     /// # Errors
     /// Where the queue manager refused for a reason other than an empty
     /// queue.
-    pub fn get(&mut self, handle: u32, wait: Duration) -> Result<Option<([u8; 24], Vec<u8>)>> {
+    pub fn get(
+        &mut self,
+        handle: u32,
+        wait: Duration,
+    ) -> Result<Option<(MessageDescriptor, Vec<u8>)>> {
         let mut body = ApiHeader::call(handle).encode().to_vec();
         body.extend_from_slice(&MessageDescriptor::datagram("").encode());
         let mut options = GET_SYNCPOINT | GET_FAIL_IF_QUIESCING;
@@ -220,7 +224,7 @@ impl Client {
             .get(..length)
             .ok_or_else(|| protocol_error("a got message shorter than its length"))?;
         self.in_unit = true;
-        Ok(Some((descriptor.message_id, data.to_vec())))
+        Ok(Some((descriptor, data.to_vec())))
     }
 
     /// `MQCMIT`: every message got under syncpoint since the last commit or
