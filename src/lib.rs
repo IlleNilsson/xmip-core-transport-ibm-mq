@@ -200,6 +200,10 @@ impl Transport for IbmMqTransport {
         )
     }
 
+    fn waiting(&self) -> transport::Waiting {
+        transport::Waiting::Waits("the get waits on an empty queue for the wait setting")
+    }
+
     /// Get the oldest message on the queue under syncpoint — one, or none
     /// where the queue is empty — on the connection kept for receiving and
     /// made on the first receive. A connection holds one unit of work, and
