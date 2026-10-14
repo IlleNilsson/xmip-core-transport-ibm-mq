@@ -470,7 +470,7 @@ mod tests {
         let second = session.next_put().expect("put").expect("one");
         assert_eq!(second.bytes, long, "a mebibyte across segments");
         let third = session.next_put().expect("put").expect("one");
-        assert!(third.bytes.is_empty());
+        assert_eq!(third.bytes, [] as [u8; 0]);
         assert!(session.next_put().expect("closed").is_none());
         let opened = sender.join().expect("thread").expect("sending");
         assert_eq!(opened, 1);
@@ -617,7 +617,7 @@ mod tests {
             ]
         );
         assert_eq!(taken, [b"one".to_vec(), b"three".to_vec()]);
-        assert!(session.queue("ORDERS").is_empty());
+        assert_eq!(session.queue("ORDERS"), [] as [Vec<u8>; 0]);
     }
 
     #[test]
@@ -654,7 +654,7 @@ mod tests {
             committing < Duration::from_millis(MESSAGES as u64),
             "{committing:?}"
         );
-        assert!(session.queue("ORDERS").is_empty());
+        assert_eq!(session.queue("ORDERS"), [] as [Vec<u8>; 0]);
     }
 
     #[test]
