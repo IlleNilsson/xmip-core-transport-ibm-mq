@@ -351,8 +351,7 @@ mod tests {
 
     #[test]
     fn a_queue_manager_that_is_not_there_is_retryable() {
-        let (listener, address) = socket::bind_tcp("127.0.0.1:0").expect("bind");
-        drop(listener);
+        let address = net::fixture::unheld().to_string();
         let error = Client::connect(&address, "QM1", DEFAULT_CHANNEL, "xmip", None)
             .err()
             .expect("refused");
