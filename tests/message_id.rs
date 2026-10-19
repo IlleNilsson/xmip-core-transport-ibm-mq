@@ -17,8 +17,8 @@ fn a_keyed_put_carries_the_journey_id_as_its_msg_id_on_every_attempt() {
     let (listener, address) = far_end.bind().expect("bound");
     let sender = thread::spawn(move || {
         let near = IbmMqTransport::new(address, "QM1", "ORDERS");
-        near.send_keyed("ORDERS", b"order", KEY)?;
-        near.send_keyed("ORDERS", b"order", KEY)?;
+        near.send_from("ORDERS", transport::Outgoing::held(b"order").keyed(KEY))?;
+        near.send_from("ORDERS", transport::Outgoing::held(b"order").keyed(KEY))?;
         near.send("ORDERS", b"order")
     });
     let mut session = far_end.accept_one(&listener, &[]).expect("accepted");
