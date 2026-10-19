@@ -212,7 +212,7 @@ impl Transport for IbmMqTransport {
     /// it or backs it out alone ([`unit`]), so a failed message never puts
     /// an accepted one back. A unit an earlier receive left without its
     /// verdict is backed out first, so its message is got again.
-    fn receive(&self) -> Result<Vec<Arrived>> {
+    fn receive_up_to(&self, _most: usize) -> Result<Vec<Arrived>> {
         let origin = Self::origin(&self.server, &self.queue_manager, &self.queue);
         let key = format!("{}/{}", self.server, self.queue_manager);
         let got = self.receivers.exchange(
@@ -244,16 +244,17 @@ impl Transport for IbmMqTransport {
             .collect())
     }
 
-    /// Put the bytes as one message on the queue the target names, on the
-    /// connection kept for its queue manager and made on the first send.
-    fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
-        self.put(target, bytes, None)
+    fn sending(&self) -> transport::Sending {
+        transport::Sending::Gathered("one MQPUT carries the whole message")
     }
 
+    /// Put the bytes as one message on the queue the target names, on the
+    /// connection kept for its queue manager and made on the first send.
     /// The key goes in the message descriptor's `MsgId`
     /// ([`descriptor::message_id_of`]), kept by the queue manager as put.
-    fn send_keyed(&self, target: &str, bytes: &[u8], key: &str) -> Result<()> {
-        self.put(target, bytes, Some(key))
+    fn send_from(&self, target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
+        let bytes: &[u8] = &outgoing.gather()?;
+        self.put(target, bytes, outgoing.key())
     }
 }
 
