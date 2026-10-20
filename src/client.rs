@@ -345,7 +345,7 @@ mod tests {
         );
         assert!(reason_error(2053, "putting").retryable, "queue full");
         assert!(!reason_error(UNKNOWN_OBJECT, "opening").retryable);
-        assert!(!reason_error(2035, "opening").retryable, "not authorised");
+        assert!(!reason_error(2035, "opening").retryable, "not authorized");
         assert!(reason_error(2085, "x").message.contains("MQRC 2085"));
     }
 

@@ -74,7 +74,7 @@ fn eyecatcher(bytes: &[u8], expected: [u8; 4], length: usize) -> Result<()> {
 
 /// The `MsgId` a keyed put carries: a UUID's sixteen octets, then eight
 /// zeros; any other key's UTF-8 octets, cut or zero-padded to twenty-four.
-/// The same key is the same id, which a consumer recognises a repeated put
+/// The same key is the same id, which a consumer recognizes a repeated put
 /// by, and which JMS reads as `JMSMessageID`, `ID:` and its hex.
 #[must_use]
 pub fn message_id_of(key: &str) -> [u8; 24] {
