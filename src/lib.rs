@@ -170,7 +170,7 @@ impl IbmMqTransport {
     /// Where a target names the server, queue manager and queue, or some
     /// suffix of them on what this transport is configured with.
     fn resolve<'a>(&'a self, target: &'a str) -> Result<(&'a str, &'a str, &'a str)> {
-        let (server, path) = Target::naming_server(&["ibm-mq", "mq"], target)
+        let (server, path) = Target::naming_server(Self::SCHEMES, target)
             .map_or((self.server.as_str(), target), |named| {
                 (named.authority(), named.path())
             });
@@ -322,6 +322,9 @@ impl Configured for IbmMqTransport {
             },
         ],
     };
+
+    /// The schemes a Location's address is entered with to choose this technology.
+    const SCHEMES: &'static [&'static str] = &["ibm-mq", "mq"];
 
     /// A Send Location puts on the queue its target names, so it has no
     /// queue of its own.
