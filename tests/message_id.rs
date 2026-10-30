@@ -1,5 +1,5 @@
 //! A keyed send carries its deduplication key as the message descriptor's
-//! `MsgId`, the same on every attempt of one Journey; an unkeyed send
+//! `MsgId`, the same on every attempt on one Journey; an unkeyed send
 //! carries none, and the queue manager assigns one.
 
 use std::thread;
