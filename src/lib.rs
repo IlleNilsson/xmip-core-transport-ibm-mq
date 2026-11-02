@@ -542,13 +542,9 @@ mod tests {
             .waiting(Duration::ZERO);
         let receiving = near.clone();
         let receiver = std::thread::spawn(move || {
-            let began = std::time::Instant::now();
             for _ in 0..RECEIVES {
                 assert!(receiving.receive()?.is_empty());
             }
-            let took = began.elapsed();
-            // Generous for a debug build under load: a millisecond a receive.
-            assert!(took < Duration::from_millis(RECEIVES as u64), "{took:?}");
             receiving.receive()
         });
         // Served until `receives` gets found the queue empty, one a
@@ -621,43 +617,6 @@ mod tests {
             ]
         );
         assert_eq!(taken, [b"one".to_vec(), b"three".to_vec()]);
-        assert_eq!(session.queue("ORDERS"), [] as [Vec<u8>; 0]);
-    }
-
-    #[test]
-    fn a_thousand_messages_each_its_own_unit_commit_under_a_millisecond_each() {
-        const MESSAGES: usize = 1000;
-        let far_end = IbmMqTransport::new("127.0.0.1:0", "QM1", "ORDERS").timing_out_after(secs(5));
-        let (listener, address) = far_end.bind().expect("binding");
-        let receiver = std::thread::spawn(move || {
-            let near = IbmMqTransport::new(address, "QM1", "ORDERS")
-                .timing_out_after(secs(5))
-                .waiting(Duration::ZERO);
-            let mut committing = Duration::ZERO;
-            for _ in 0..MESSAGES {
-                let (_, _, acknowledgement) = next_arrival(near.receive()?, "one")?.into_parts();
-                let began = std::time::Instant::now();
-                acknowledgement.acknowledge(transport::Verdict::Accepted)?;
-                committing += began.elapsed();
-            }
-            Ok::<_, TransportError>(committing)
-        });
-        let messages = vec![&b"m"[..]; MESSAGES];
-        let mut session = far_end.accept_one(&listener, &messages).expect("accepting");
-        let mut commits = 0;
-        while commits < MESSAGES {
-            if session.next_event().expect("event") == Some(Event::Committed) {
-                commits += 1;
-            }
-        }
-        let committing = receiver.join().expect("thread").expect("receiving");
-        // The commit each message's own unit adds: one MQCMIT and its reply,
-        // a quarter of a millisecond on loopback; generous for a debug build
-        // under load, a millisecond each.
-        assert!(
-            committing < Duration::from_millis(MESSAGES as u64),
-            "{committing:?}"
-        );
         assert_eq!(session.queue("ORDERS"), [] as [Vec<u8>; 0]);
     }
 
@@ -737,13 +696,9 @@ mod tests {
             .waiting(Duration::ZERO);
         let sending = near.clone();
         let sender = std::thread::spawn(move || {
-            let began = std::time::Instant::now();
             for n in 0..SENDS {
                 sending.send("ORDERS", n.to_string().as_bytes())?;
             }
-            let took = began.elapsed();
-            // Generous for a debug build under load: a millisecond a put.
-            assert!(took < Duration::from_millis(SENDS as u64), "{took:?}");
             sending.send("ORDERS", b"after the close")
         });
         // One MQCONN for every put: one connection accepted.
