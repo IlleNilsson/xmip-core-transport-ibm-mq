@@ -20,7 +20,7 @@
 //! accepted or refused it, `MQBACK` puts it back where the cycle failed
 //! ([`unit`]). A Send Location connects, opens for output and puts the
 //! Stream as one datagram. `client.rs` is Xmip's side; `manager.rs` is the queue
-//! manager a test or the playground puts on loopback. No channel exit, no
+//! manager a test or the essentials puts on loopback. No channel exit, no
 //! user identification record and no TLS are spoken; a queue manager that
 //! demands them refuses the connection with its reason, and this transport
 //! says so.
