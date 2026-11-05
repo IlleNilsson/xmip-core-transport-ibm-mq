@@ -1,5 +1,5 @@
 //! The queue manager's side of one conversation: what a test puts at the
-//! far end, and what the playground drives.
+//! far end, and what the essentials drives.
 //!
 //! Not MQ. One queue manager holds named queues in memory, answers the
 //! initial data with its own, checks its name on `MQCONN`, hands out
