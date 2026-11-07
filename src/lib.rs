@@ -396,6 +396,7 @@ impl Loopback for IbmMqTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use transport::arrived::next_arrival;
     use transport::payload::edge_payloads;
 
@@ -510,17 +511,15 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, Event::Got(_) | Event::Committed | Event::BackedOut))
             .collect();
-        assert!(
-            matches!(
-                gets_and_settles[..],
-                [
-                    Event::Got(_),
-                    Event::Committed,
-                    Event::Got(_),
-                    Event::Committed,
-                    Event::Got(_)
-                ]
-            ),
+        assert_matches!(
+            gets_and_settles[..],
+            [
+                Event::Got(_),
+                Event::Committed,
+                Event::Got(_),
+                Event::Committed,
+                Event::Got(_)
+            ],
             "a get and its commit, a get and its commit, then 2033: {events:?}"
         );
         let arrived = receiver.join().expect("thread").expect("receiving");
