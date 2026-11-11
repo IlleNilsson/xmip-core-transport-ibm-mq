@@ -35,7 +35,9 @@
 //! `ibm-mq://host:1414/QM1/ORDERS?msgid=414d5120...`. A send target is
 //! `ibm-mq://host:1414/<queue manager>/<queue>`,
 //! `host:1414/<queue manager>/<queue>`, `<queue manager>/<queue>` on the
-//! configured server, or `<queue>` on the configured queue manager.
+//! configured server, `<queue>` on the configured queue manager, or empty
+//! for the configured queue — what a Send Location names, its address being
+//! the listener alone (`settings.rs`, ADR-0064, amendment 2026-11-10).
 //!
 //! The transport is its own far end (ADR-0051): [`Loopback`] stands the
 //! queue manager up at the server address and takes the one put.
@@ -44,6 +46,7 @@ pub mod client;
 pub mod descriptor;
 pub mod manager;
 pub mod segment;
+mod settings;
 pub mod unit;
 
 use std::net::TcpListener;
@@ -59,7 +62,6 @@ use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
 use transport::{Arrived, Configured, Directions, Pool, Taken, Transport};
-use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
 /// How long a receive's get waits on an empty queue when the Location
 /// does not say (`wait`): a message put meanwhile is got at once, so the
@@ -168,8 +170,13 @@ impl IbmMqTransport {
     }
 
     /// Where a target names the server, queue manager and queue, or some
-    /// suffix of them on what this transport is configured with.
+    /// suffix of them on what this transport is configured with, or is
+    /// empty and the queue it is configured with
+    /// (`transport::destination::named`).
     fn resolve<'a>(&'a self, target: &'a str) -> Result<(&'a str, &'a str, &'a str)> {
+        let Some(target) = transport::destination::named(target) else {
+            return Ok((&self.server, &self.queue_manager, &self.queue));
+        };
         let (server, path) = Target::naming_server(Self::SCHEMES, target)
             .map_or((self.server.as_str(), target), |named| {
                 (named.authority(), named.path())
@@ -276,73 +283,6 @@ impl IbmMqTransport {
     }
 }
 
-impl Configured for IbmMqTransport {
-    /// The address is the queue manager's listener, host and port: where a
-    /// Location connects.
-    const SETTINGS: &'static Settings = &Settings {
-        technology: env!("CARGO_PKG_NAME"),
-        settings: &[
-            Setting {
-                name: "queue_manager",
-                kind: Kind::Text,
-                presence: Presence::Required,
-                meaning: "The queue manager a Location connects to unless the target names \
-                          another.",
-                applies: Applies::Both,
-            },
-            Setting {
-                name: "queue",
-                kind: Kind::Text,
-                presence: Presence::Required,
-                meaning: "The queue a Location gets every waiting message from.",
-                applies: Applies::Receive,
-            },
-            Setting {
-                name: "channel",
-                kind: Kind::Text,
-                presence: Presence::Default(Fixed::Text(DEFAULT_CHANNEL)),
-                meaning: "The server-connection channel a Location connects on.",
-                applies: Applies::Both,
-            },
-            Setting {
-                name: "timeout",
-                kind: Kind::Duration,
-                presence: Presence::Optional,
-                meaning: "How long a queue manager that stops mid-reply is waited on; \
-                          unbounded when left out.",
-                applies: Applies::Both,
-            },
-            Setting {
-                name: "wait",
-                kind: Kind::Duration,
-                presence: Presence::Default(Fixed::Duration(DEFAULT_WAIT)),
-                meaning: "How long a receive waits on an empty queue for a message to be put \
-                          (MQGMO_WAIT); zero answers at once.",
-                applies: Applies::Receive,
-            },
-        ],
-    };
-
-    /// The schemes a Location's address is entered with to choose this technology.
-    const SCHEMES: &'static [&'static str] = &["ibm-mq", "mq"];
-
-    /// A Send Location puts on the queue its target names, so it has no
-    /// queue of its own.
-    fn configured(address: &str, settings: &Read) -> Result<Self> {
-        let transport = Self::new(
-            address,
-            settings.text("queue_manager"),
-            settings.optional_text("queue").unwrap_or_default(),
-        )
-        .on_channel(settings.text("channel"))
-        .waiting(settings.optional_duration("wait").unwrap_or(DEFAULT_WAIT));
-        Ok(match settings.optional_duration("timeout") {
-            Some(timeout) => transport.timing_out_after(timeout),
-            None => transport,
-        })
-    }
-}
-
 impl IbmMqTransport {
     /// Both ends on this machine: the queue manager stands up on an
     /// ephemeral local port with one queue, the loopback timeout on both
@@ -402,41 +342,6 @@ mod tests {
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
-    }
-
-    #[test]
-    fn ibm_mq_declares_its_settings_and_reads_through_them() {
-        use xcore::settings::Given;
-        assert_eq!(IbmMqTransport::SETTINGS.problems(), Vec::<String>::new());
-        let given = [
-            ("queue_manager".to_string(), Given::Text("QM1".to_string())),
-            ("queue".to_string(), Given::Text("ORDERS".to_string())),
-            ("timeout".to_string(), Given::Text("15s".to_string())),
-        ];
-        let built =
-            IbmMqTransport::open("mq.example:1414", Applies::Receive, &given).expect("built");
-        assert_eq!(built.queue_manager, "QM1");
-        assert_eq!(built.queue, "ORDERS");
-        assert_eq!(built.channel, DEFAULT_CHANNEL);
-        assert_eq!(built.timeout, Some(secs(15)));
-        assert_eq!(built.wait, DEFAULT_WAIT);
-        let given = [
-            given[0].clone(),
-            given[1].clone(),
-            ("wait".to_string(), Given::Text("250ms".to_string())),
-        ];
-        let waiting = IbmMqTransport::open("mq.example:1414", Applies::Receive, &given);
-        assert_eq!(waiting.expect("built").wait, Duration::from_millis(250));
-        let Err(refused) = IbmMqTransport::open("mq.example:1414", Applies::Send, &given[1..2])
-        else {
-            panic!("a Send Location's queue manager is required, and it names no queue");
-        };
-        assert!(
-            refused.message.contains("\"queue_manager\""),
-            "{}",
-            refused.message
-        );
-        assert!(refused.message.contains("\"queue\""), "{}", refused.message);
     }
 
     #[test]
@@ -772,6 +677,10 @@ mod tests {
             ("other:1414", "QM2", "Q")
         );
         assert_eq!(mq.resolve("Q").expect("queue"), ("host:1414", "QM1", "Q"));
+        assert_eq!(
+            mq.resolve(transport::destination::OWN).expect("its own"),
+            ("host:1414", "QM1", "ORDERS")
+        );
     }
 
     /// The payloads a message must carry whole, and one at `MAXMSGL`.
