@@ -37,14 +37,12 @@ impl Configured for IbmMqTransport {
                 meaning: "The server-connection channel a Location connects on.",
                 applies: Applies::Both,
             },
-            Setting {
-                name: "timeout",
-                kind: Kind::Duration,
-                presence: Presence::Optional,
-                meaning: "How long a queue manager that stops mid-reply is waited on; \
-                          unbounded when left out.",
-                applies: Applies::Both,
-            },
+            transport::configured::timeout(
+                Applies::Both,
+                None,
+                "How long a queue manager that stops mid-reply is waited on; \
+                 unbounded when left out.",
+            ),
             Setting {
                 name: "wait",
                 kind: Kind::Duration,
@@ -65,18 +63,18 @@ impl Configured for IbmMqTransport {
         destination::OWN
     }
 
+    fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
+        Some(&mut self.timeout)
+    }
+
     fn configured(address: &str, settings: &Read) -> Result<Self> {
-        let transport = Self::new(
+        Ok(Self::new(
             address,
             settings.text("queue_manager"),
             settings.text("queue"),
         )
         .on_channel(settings.text("channel"))
-        .waiting(settings.optional_duration("wait").unwrap_or(DEFAULT_WAIT));
-        Ok(match settings.optional_duration("timeout") {
-            Some(timeout) => transport.timing_out_after(timeout),
-            None => transport,
-        })
+        .waiting(settings.optional_duration("wait").unwrap_or(DEFAULT_WAIT)))
     }
 }
 

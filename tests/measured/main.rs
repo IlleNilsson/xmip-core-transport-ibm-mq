@@ -19,6 +19,7 @@
 
 use std::time::{Duration, Instant};
 
+use transport::Configured;
 use transport::arrived::next_arrival;
 use transport::{Transport, TransportError};
 use xcore::fastest::FIVE;

@@ -122,13 +122,6 @@ impl IbmMqTransport {
         self
     }
 
-    /// Give up on a queue manager that stops mid-reply.
-    #[must_use]
-    pub const fn timing_out_after(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
     /// Connect to the configured queue manager.
     ///
     /// # Errors
