@@ -538,11 +538,13 @@ mod tests {
             let began = std::time::Instant::now();
             let empty = near.receive()?;
             let waited = began.elapsed();
-            // Something is put while the next get waits: got at once.
+            // Something is put while the next get waits: got. How soon
+            // after its wait the empty get gives up, and how soon the put
+            // ends the next one's, is the timing program's
+            // (`tests/measured`).
             asked.send(()).expect("told");
-            let began = std::time::Instant::now();
             let got = next_arrival(near.receive()?, "put while waiting")?.taken()?;
-            Ok::<_, TransportError>((empty.len(), waited, got.bytes, began.elapsed()))
+            Ok::<_, TransportError>((empty.len(), waited, got.bytes))
         });
         let mut session = far_end.accept_one(&listener, &[]).expect("accepting");
         let putting = session.putting();
@@ -554,12 +556,10 @@ mod tests {
         });
         while session.next_event().expect("event").is_some() {}
         putter.join().expect("putter");
-        let (empty, waited, got, took) = receiver.join().expect("thread").expect("receiving");
+        let (empty, waited, got) = receiver.join().expect("thread").expect("receiving");
         assert_eq!(empty, 0, "2033 after the wait is an empty receive");
         assert!(waited >= WAIT, "the queue manager waited: {waited:?}");
-        assert!(waited < WAIT * 3, "and no longer: {waited:?}");
         assert_eq!(got, b"C1");
-        assert!(took < WAIT, "a put ends the wait: {took:?}");
     }
 
     #[test]
