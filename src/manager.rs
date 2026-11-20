@@ -179,8 +179,7 @@ impl Session {
         self.manager
             .queues
             .get(queue)
-            .map(|held| held.iter().cloned().collect())
-            .unwrap_or_default()
+            .map_or_default(|held| held.iter().cloned().collect())
     }
 
     /// The next message the client put, or `None` when it disconnected.
@@ -241,7 +240,7 @@ impl Session {
     }
 
     fn connect(&self, body: &[u8]) -> (Vec<u8>, Event) {
-        let asked = body.get(..48).map(text_of).unwrap_or_default();
+        let asked = body.get(..48).map_or_default(text_of);
         if !asked.is_empty() && asked != self.manager.name {
             return refused(QUEUE_MANAGER_NAME_ERROR, 0);
         }
