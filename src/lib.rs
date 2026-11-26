@@ -12,7 +12,7 @@
 //! options, the object descriptor. A Receive Location connects, opens its
 //! queue for input and gets one message a receive under syncpoint, a
 //! Stream with the id MQ gave it; an empty queue is waited on by the queue
-//! manager for the `wait` setting (`MQGMO_WAIT`, [`DEFAULT_WAIT`]), a
+//! manager for the `wait` setting (`MQGMO_WAIT`, [`declaration::DEFAULT_WAIT`]), a
 //! message put meanwhile got at once, and `2033`, no message available,
 //! after it is an empty receive, so an idle Location never spins; each
 //! message is its own unit of work, and its own
@@ -37,38 +37,57 @@
 //! `host:1414/<queue manager>/<queue>`, `<queue manager>/<queue>` on the
 //! configured server, `<queue>` on the configured queue manager, or empty
 //! for the configured queue — what a Send Location names, its address being
-//! the listener alone (`settings.rs`, ADR-0064, amendment 2026-11-10).
+//! the listener alone (`configured.rs`, ADR-0064, amendment 2026-11-10).
 //!
 //! The transport is its own far end (ADR-0051): [`Loopback`] stands the
 //! queue manager up at the server address and takes the one put.
+//!
+//! **Built with its `declaration` feature alone** the crate is
+//! [`declaration`], what a Location of it is configured with, the channel
+//! and the wait it takes unless told otherwise among it, and none of the
+//! code above, which is behind the default feature: what the surfaces'
+//! library carries (ADR-0064, amendment 2026-11-26).
 
+#[cfg(feature = "default")]
 pub mod client;
+#[cfg(feature = "default")]
+mod configured;
+#[cfg(feature = "declaration")]
+pub mod declaration;
+#[cfg(feature = "default")]
 pub mod descriptor;
+#[cfg(feature = "default")]
 pub mod manager;
+#[cfg(feature = "default")]
 pub mod segment;
-mod settings;
+#[cfg(feature = "default")]
 pub mod unit;
 
+#[cfg(feature = "default")]
 use std::net::TcpListener;
+#[cfg(feature = "default")]
 use std::time::Duration;
 
-pub use client::{Client, DEFAULT_CHANNEL, DEFAULT_MAX_MESSAGE};
+#[cfg(feature = "default")]
+pub use client::{Client, DEFAULT_MAX_MESSAGE};
+#[cfg(feature = "default")]
 use context::property::IBM_MQ_USER_IDENTIFIER;
+#[cfg(feature = "default")]
+use declaration::{DEFAULT_CHANNEL, DEFAULT_WAIT};
+#[cfg(feature = "default")]
 pub use manager::{Event, QueueManager, Session};
+#[cfg(feature = "default")]
 use net::Target;
-use transport::ArrivalIdentity;
+#[cfg(feature = "default")]
 use transport::error::{Result, TransportError, protocol_error};
+#[cfg(feature = "default")]
 use transport::listening::{Accepting, Listening};
+#[cfg(feature = "default")]
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
-use transport::socket;
-use transport::{Arrived, Configured, Directions, Pool, Taken, Transport};
+#[cfg(feature = "default")]
+use transport::{ArrivalIdentity, Arrived, Configured, Directions, Pool, Taken, Transport, socket};
 
-/// How long a receive's get waits on an empty queue when the Location
-/// does not say (`wait`): a message put meanwhile is got at once, so the
-/// wait adds nothing to a message's latency, and a Location stopping is
-/// heard within it.
-pub const DEFAULT_WAIT: Duration = Duration::from_secs(1);
-
+#[cfg(feature = "default")]
 #[derive(Clone)]
 pub struct IbmMqTransport {
     server: String,
@@ -87,6 +106,7 @@ pub struct IbmMqTransport {
     receivers: Pool<Client>,
 }
 
+#[cfg(feature = "default")]
 impl IbmMqTransport {
     /// Speak to `queue_manager` at `server`, on `queue`.
     #[must_use]
@@ -185,6 +205,7 @@ impl IbmMqTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Transport for IbmMqTransport {
     fn name(&self) -> &'static str {
         "ibm-mq"
@@ -258,6 +279,7 @@ impl Transport for IbmMqTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl IbmMqTransport {
     /// The one send, on the connection kept for the target's queue manager.
     fn put(&self, target: &str, bytes: &[u8], key: Option<&str>) -> Result<()> {
@@ -276,6 +298,7 @@ impl IbmMqTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl IbmMqTransport {
     /// Both ends on this machine: the queue manager stands up on an
     /// ephemeral local port with one queue, the loopback timeout on both
@@ -286,6 +309,7 @@ impl IbmMqTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Accepting for IbmMqTransport {
     fn take_one(self, listener: &TcpListener) -> Result<Taken> {
         let mut session = self.accept_one(listener, &[])?;
@@ -299,6 +323,7 @@ impl Accepting for IbmMqTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Loopback for IbmMqTransport {
     fn arrival_identity(&self) -> ArrivalIdentity {
         ArrivalIdentity::Unnamed(

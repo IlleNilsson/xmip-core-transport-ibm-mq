@@ -29,8 +29,6 @@ use crate::segment::{
 /// The largest message a queue manager carries unless told otherwise:
 /// four mebibytes, `MAXMSGL` as MQ ships it.
 pub const DEFAULT_MAX_MESSAGE: u32 = 4 * 1024 * 1024;
-/// The channel a client connects on unless told otherwise.
-pub const DEFAULT_CHANNEL: &str = "SYSTEM.DEF.SVRCONN";
 
 /// `MQRC_NO_MSG_AVAILABLE`.
 pub const NO_MESSAGE: u32 = 2033;
@@ -336,6 +334,7 @@ fn reason_error(reason: u32, context: &str) -> TransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::declaration::DEFAULT_CHANNEL;
 
     #[test]
     fn a_reason_is_judged_for_resilience() {

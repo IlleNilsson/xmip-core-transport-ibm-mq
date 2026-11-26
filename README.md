@@ -14,6 +14,10 @@ A Send Location puts on the queue its `queue` setting names, on the queue manage
 
 A keyed send (the key `Transport::send_from` is handed, `Outgoing::key`; built 2026-10-04) carries the Journey's identifier as the message descriptor's `MsgId` (`descriptor::message_id_of`): a UUID's sixteen octets then eight zeros, any other key's UTF-8 octets cut or zero-padded to twenty-four, the same on every attempt on one Journey. The put asks no `MQPMO_NEW_MSG_ID`, so the queue manager keeps it as put; a queue manager does not drop a repeated put by it, and a consumer recognizes the repeat by its `MsgId` — JMS reads it as `JMSMessageID`, `ID:` and its hex. An unkeyed `send` puts `MQMI_NONE` and the queue manager assigns one, as the in-process `QueueManager` now does too: it kept no id a client put until then.
 
+## The declaration
+
+What a Location of this technology is configured with is two `const`s in its `declaration` module, `src/declaration.rs`, beside the code, which `Configured` reads (ADR-0064, amendment 2026-11-26): `declaration::SETTINGS`, `queue_manager`, `queue`, `channel`, `timeout` and `wait`, and `SCHEMES`, `ibm-mq` and `mq`. The channel and the wait a Location takes unless told otherwise, `declaration::DEFAULT_CHANNEL` and `DEFAULT_WAIT`, are declared there too, and the code takes them from there; the `Configured` impl that reads the declaration is `src/configured.rs`, which held the declaration as `settings.rs` until 2026-11-26. Built with its `declaration` feature alone (`--no-default-features --features declaration`), the crate is those and nothing more: its code and every crate the code is built on are behind the default feature. So the library the surfaces load can carry it without the code, for the language server and the desktop to suggest and check an IBM MQ Location's settings though no node in their process loaded the technology, once the gathering crate of open problem 48 links it. `test/Declaration.Test.ps1` in the estate holds that the declaration builds nothing the transport capability does not.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it

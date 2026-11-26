@@ -1,61 +1,18 @@
-//! What an IBM MQ Location is configured with, declared once and read
-//! through (ADR-0064, amendment 2026-09-26).
+//! An IBM MQ Location built from what it is configured with, its
+//! declaration read through (`declaration.rs`; ADR-0064, amendments
+//! 2026-09-26 and 2026-11-26).
 
 use transport::Configured;
 use transport::destination;
 use transport::error::Result;
-use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
+use xcore::settings::{Read, Settings};
 
-use crate::{DEFAULT_CHANNEL, DEFAULT_WAIT, IbmMqTransport};
+use crate::IbmMqTransport;
+use crate::declaration::{self, DEFAULT_WAIT};
 
 impl Configured for IbmMqTransport {
-    /// The address is the queue manager's listener, host and port: where a
-    /// Location connects.
-    const SETTINGS: &'static Settings = &Settings {
-        technology: env!("CARGO_PKG_NAME"),
-        settings: &[
-            Setting {
-                name: "queue_manager",
-                kind: Kind::Text,
-                presence: Presence::Required,
-                meaning: "The queue manager a Location connects to unless the target names \
-                          another.",
-                applies: Applies::Both,
-            },
-            Setting {
-                name: "queue",
-                kind: Kind::Text,
-                presence: Presence::Required,
-                meaning: "The queue a Receive Location gets every waiting message from, or a \
-                          Send Location puts on.",
-                applies: Applies::Both,
-            },
-            Setting {
-                name: "channel",
-                kind: Kind::Text,
-                presence: Presence::Default(Fixed::Text(DEFAULT_CHANNEL)),
-                meaning: "The server-connection channel a Location connects on.",
-                applies: Applies::Both,
-            },
-            transport::configured::timeout(
-                Applies::Both,
-                None,
-                "How long a queue manager that stops mid-reply is waited on; \
-                 unbounded when left out.",
-            ),
-            Setting {
-                name: "wait",
-                kind: Kind::Duration,
-                presence: Presence::Default(Fixed::Duration(DEFAULT_WAIT)),
-                meaning: "How long a receive waits on an empty queue for a message to be put \
-                          (MQGMO_WAIT); zero answers at once.",
-                applies: Applies::Receive,
-            },
-        ],
-    };
-
-    /// The schemes a Location's address is entered with to choose this technology.
-    const SCHEMES: &'static [&'static str] = &["ibm-mq", "mq"];
+    const SETTINGS: &'static Settings = declaration::SETTINGS;
+    const SCHEMES: &'static [&'static str] = declaration::SCHEMES;
 
     /// The queue manager and queue settings: the address names only the
     /// listener.
@@ -82,9 +39,10 @@ impl Configured for IbmMqTransport {
 mod tests {
     use super::*;
     use crate::QueueManager;
+    use crate::declaration::DEFAULT_CHANNEL;
     use std::time::Duration;
     use transport::{Transport, socket};
-    use xcore::settings::Given;
+    use xcore::settings::{Applies, Given};
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
