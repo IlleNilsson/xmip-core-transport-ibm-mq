@@ -43,10 +43,8 @@
 //! queue manager up at the server address and takes the one put.
 //!
 //! **Built with its `declaration` feature alone** the crate is
-//! [`declaration`], what a Location of it is configured with, the channel
-//! and the wait it takes unless told otherwise among it, and none of the
-//! code above, which is behind the default feature: what the surfaces'
-//! library carries (ADR-0064, amendment 2026-11-26).
+//! [`declaration`], the channel and the wait it takes unless told otherwise
+//! among it.
 
 #[cfg(feature = "default")]
 pub mod client;
